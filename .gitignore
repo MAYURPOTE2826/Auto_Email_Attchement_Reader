@@ -6,7 +6,9 @@ __pycache__/
 *.pyc
 
 # Logs
-app.log
+app.log*
+heartbeat.txt
+worker.log
 
 # Attachments
 attachments/
@@ -16,6 +18,9 @@ processed_emails.txt
 *.db
 *.sqlite
 *.sqlite3
+
+# Test cache
+.pytest_cache/
 
 # IDE
 .vscode/
