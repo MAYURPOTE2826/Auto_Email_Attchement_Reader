@@ -42,7 +42,7 @@ schtasks /create ^
     /tr "\"%WORKER_PATH%\"" ^
     /sc onstart ^
     /delay 0000:01 ^
-    /ru "%USERNAME%" ^
+    /ru "SYSTEM" ^
     /rl HIGHEST ^
     /f
 

@@ -31,7 +31,7 @@ class TestConfig(unittest.TestCase):
 
     def test_use_gmail_labels_default_true(self):
         """USE_GMAIL_LABELS must default to True for Gmail users"""
-        with patch.dict(os.environ, {}, clear=False):
+        with patch.dict(os.environ, {}, clear=True):
             # Remove key if present so default kicks in
             os.environ.pop("USE_GMAIL_LABELS", None)
             # Re-evaluate the expression as Config does
@@ -76,6 +76,9 @@ class TestAttachmentHandler(unittest.TestCase):
             ("Report@Gmail&2026.pdf",    "Report_Gmail_2026.pdf"),
             ("My File (1).pdf",          "My_File__1_.pdf"),
             ("Valid_Name.pdf",           "Valid_Name.pdf"),
+            ("malware.vbs.",             "malware.vbs"),
+            ("malware.vbs. . .",         "malware.vbs"),
+            ("invoice.pdf .exe",         "invoice.pdf_.exe"),
         ]
         for input_name, expected in test_cases:
             result = sanitize_filename(input_name)
@@ -195,6 +198,7 @@ class TestAttachmentHandler(unittest.TestCase):
         mock_mail.uid.side_effect = [
             ('OK', [b'(RFC822.SIZE 100)']),
             ('OK', [(b'1 (RFC822 {100})', raw_email)]),
+            ('OK', [b'1']), # Mock response for the STORE command
         ]
 
         result = process_email(mock_mail, b'123')
@@ -282,7 +286,7 @@ class TestEmailReader(unittest.TestCase):
         mock_imap.return_value = mock_mail
 
         # Credentials are now read fresh from os.getenv() — patch via env, not Config
-        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "wrong_password"}):
+        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "wrong_password"}, clear=True):
             with self.assertRaises(CredentialError):
                 connect_mail()
 
@@ -294,7 +298,7 @@ class TestEmailReader(unittest.TestCase):
         mock_imap.return_value = mock_mail
 
         from email_reader import connect_mail
-        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "password"}):
+        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "password"}, clear=True):
             with self.assertRaises(Exception) as ctx:
                 connect_mail()
             assert 'mailbox' in str(ctx.exception).lower()
@@ -322,7 +326,7 @@ class TestEmailReader(unittest.TestCase):
         mock_mail.select.return_value = ('OK', [b'1'])
         mock_imap.return_value = mock_mail
 
-        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "password"}):
+        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "password"}, clear=True):
             connect_mail()
 
         # timeout= kwarg must be passed to IMAP4_SSL constructor
@@ -340,7 +344,7 @@ class TestEmailReader(unittest.TestCase):
         mock_mail.select.return_value = ('OK', [b'1'])
         mock_imap.return_value = mock_mail
 
-        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "password"}):
+        with patch.dict(os.environ, {"EMAIL_USER": "test@gmail.com", "EMAIL_PASS": "password"}, clear=True):
             result = connect_mail()
             assert result == mock_mail
             mock_mail.login.assert_called_once()
@@ -647,7 +651,7 @@ class TestProduction(unittest.TestCase):
                 mark_failed(b'abc')
                 assert get_email_status(b'abc') == 'failed'
                 reset_failed_emails()
-                assert get_email_status(b'abc') is None
+                assert get_email_status(b'abc') == 'retry'
 
     def test_reset_failed_leaves_done_emails_intact(self):
         from main import init_db, mark_in_progress, save_processed, mark_failed, get_email_status, reset_failed_emails
@@ -662,7 +666,7 @@ class TestProduction(unittest.TestCase):
                 mark_failed(b'fail1')
                 reset_failed_emails()
                 assert get_email_status(b'done1') == 'done'
-                assert get_email_status(b'fail1') is None
+                assert get_email_status(b'fail1') == 'retry'
 
     def test_send_alert_skipped_when_no_alert_email(self):
         from main import send_alert
@@ -677,7 +681,7 @@ class TestProduction(unittest.TestCase):
 
         # Both EMAIL_USER and EMAIL_PASS are now read fresh from os.getenv()
         with patch.object(Config, 'ALERT_EMAIL', 'admin@example.com'):
-            with patch.dict(os.environ, {"EMAIL_USER": "sender@gmail.com", "EMAIL_PASS": "apppassword"}):
+            with patch.dict(os.environ, {"EMAIL_USER": "sender@gmail.com", "EMAIL_PASS": "apppassword"}, clear=True):
                 with patch('main.smtplib.SMTP_SSL') as mock_smtp_cls:
                     mock_smtp = MagicMock()
                     mock_smtp_cls.return_value.__enter__ = MagicMock(return_value=mock_smtp)

@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import os
+import re
+import sys
 import time
 import shutil
 import signal
@@ -9,10 +13,13 @@ import atexit
 from email.mime.text import MIMEText
 from config import Config
 from db import (
-    _db_conn, _decode_id, init_db, get_email_status, get_retry_count,
+    # Internal helpers used by the main loop
+    _db_conn, _decode_id, init_db, get_email_record,
     mark_in_progress, save_processed, mark_retry, mark_failed, reset_failed_emails,
+    # Re-exported so the test suite can import them from main (backward compat)
+    get_email_status, get_retry_count,
 )
-from email_reader import connect_mail, CredentialError
+from email_reader import connect_mail, CredentialError, QuotaError
 from attachment_handler import process_email
 from logger import (
     log_debug, log_info, log_warning, log_error, log_exception,
@@ -45,87 +52,70 @@ def _handle_signal(signum, frame):
 # Instance singleton lock — prevents two processes from running simultaneously
 # ---------------------------------------------------------------------------
 
-def _process_is_alive(pid: int) -> bool:
-    """Return True if a process with *pid* is currently running.
-
-    os.kill(pid, 0) checks process existence without sending a signal.
-    Behaviour by platform:
-      Unix  — ProcessLookupError if dead; PermissionError if alive but not ours.
-      Windows — PermissionError if dead (no PROCESS_QUERY_INFORMATION rights);
-                returns normally if alive.
-    We treat PermissionError conservatively (assume alive) so we never
-    silently stomp on a live process on either platform.
-    """
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False       # Unix: process definitely gone
-    except PermissionError:
-        return True        # conservative — assume alive on both platforms
-    except OSError:
-        return False
-
+_lock_fd = None
 
 def _acquire_instance_lock() -> None:
     """Prevent two instances of the processor from running simultaneously.
 
-    Uses O_CREAT | O_EXCL for atomic creation.  On startup, when an existing
-    lockfile is found the stored PID is checked; if that process is gone the
-    stale file is removed and we proceed.  _release_instance_lock is registered
-    via atexit so normal exit (and sys.exit / raise SystemExit) always cleans up.
+    Uses an OS-level file lock which is automatically released by the kernel
+    if the process crashes or is killed. This eliminates the PID recycling
+    deadlock present in the previous implementation.
 
     Raises:
-        SystemExit: if another live instance is detected.
+        SystemExit: if another live instance is currently holding the lock.
     """
-    def _write_lock():
-        fd = os.open(_LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, 'w') as f:
-            f.write(str(os.getpid()))
-
+    global _lock_fd
     try:
-        _write_lock()
-    except FileExistsError:
-        # Read the PID from the existing lock file
-        try:
-            with open(_LOCKFILE) as fh:
-                old_pid = int(fh.read().strip())
-        except (OSError, ValueError):
-            old_pid = None
-
-        if old_pid and _process_is_alive(old_pid):
-            raise SystemExit(
-                f"Another instance of Email Assetcues is already running "
-                f"(PID {old_pid}).  Stop it first, or delete {_LOCKFILE} "
-                f"if you are sure it is stale."
-            )
-
-        # Stale lock — safe to remove and retry
-        log_warning(
-            f"Removing stale lock file (PID {old_pid} is no longer running)"
-        )
-        try:
-            os.remove(_LOCKFILE)
-        except OSError:
-            pass
-
-        try:
-            _write_lock()
-        except FileExistsError:
-            raise SystemExit(
-                "Could not acquire instance lock — please delete "
-                f"{_LOCKFILE} and retry."
-            )
-
-    atexit.register(_release_instance_lock)
-
-
-def _release_instance_lock() -> None:
-    """Remove the PID lockfile on clean exit."""
-    try:
-        os.remove(_LOCKFILE)
+        _lock_fd = os.open(_LOCKFILE, os.O_CREAT | os.O_RDWR)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(_lock_fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        pass
+        raise SystemExit(
+            "Another instance of Email Assetcues is already running. "
+            f"If you are sure it is not, check the lock file at {_LOCKFILE}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# IMAP quota / rate-limit detection
+#
+# A compiled regex is used instead of a frozenset so we can match multi-word
+# phrases ('TOO MANY', 'RATE LIMIT') without splitting on spaces first.
+# Checked against the string representation of any unclassified Exception that
+# reaches the outer except handler in the main loop — catches quota responses
+# from SEARCH and FETCH operations (which happen inside the try block, not
+# inside connect_mail, so QuotaError is not raised for them).
+# ---------------------------------------------------------------------------
+_QUOTA_RE = re.compile(
+    r'OVERQUOTA|THROTTLED|TOO.MANY|TOOMANYSIMULTANEOUS|RATE.?LIMIT|SLOW.DOWN',
+    re.IGNORECASE,
+)
+
+# How long to back off when a quota / throttle response is detected.
+# 5 minutes is the standard recommendation for Gmail IMAP quota recovery.
+_QUOTA_BACKOFF_SEC = 300
+
+# ---------------------------------------------------------------------------
+# Alert body sanitisation
+#
+# error_msg = str(e) is embedded verbatim in alert emails.  A future imaplib
+# or smtplib version could include auth details in an exception string.
+# Redact anything that looks like a Gmail app-password (four 4-letter groups
+# separated by spaces) before it leaves the process in an email body.
+# ---------------------------------------------------------------------------
+_CRED_RE = re.compile(
+    r'\b[a-z]{4}(?:\s[a-z]{4}){3}\b',
+    re.IGNORECASE,
+)
+
+
+def _safe_error(msg: str) -> str:
+    """Redact potential credential strings from an error message."""
+    return _CRED_RE.sub('[REDACTED]', msg)
 
 
 # ---------------------------------------------------------------------------
@@ -136,38 +126,83 @@ def send_alert(subject: str, body: str) -> None:
     """Send an alert email when the app encounters a fatal problem.
 
     Uses a separate try/except so a broken alert path never crashes the main
-    loop.  If EMAIL credentials are invalid, this SMTP attempt will also fail
-    — that failure is logged and swallowed intentionally.
+    loop.  SMTP failure is logged and swallowed intentionally.
 
-    Both EMAIL_USER and EMAIL_PASS are read fresh from the environment so that
-    credential rotation takes effect without a process restart.
+    Credential resolution order (both read fresh from the environment):
+      1. ALERT_SMTP_USER / ALERT_SMTP_PASS  — dedicated alert account.
+      2. EMAIL_USER / EMAIL_PASS            — fallback when no dedicated
+                                             account is configured.
+
+    Using a dedicated alert account (ALERT_SMTP_USER) is strongly recommended:
+    send_alert() is also called when IMAP credentials fail.  If both IMAP and
+    SMTP share the same credentials, the alert silently fails at exactly the
+    moment it is most needed.
+
+    A SOCKET_TIMEOUT_SEC timeout is applied to the SMTP connection so a
+    blocked or unreachable SMTP host never stalls the main loop for minutes.
+
+    Credentials are blanked in a finally block to ensure the local references
+    are removed even when smtp.send_message() raises an exception.
     """
     if not Config.ALERT_EMAIL:
         return
+
+    # Pre-initialise to empty string so 'del' in finally always finds the names
+    # regardless of whether the try body raised before the assignment.
+    _user = _pw = ""
     try:
+        _user = (os.getenv("ALERT_SMTP_USER") or os.getenv("EMAIL_USER", "")).strip()
+        _pw   = (os.getenv("ALERT_SMTP_PASS") or os.getenv("EMAIL_PASS", "")).strip()
+
         msg = MIMEText(body, 'plain', 'utf-8')
         msg['Subject'] = subject
-        # Read both credentials fresh — consistent with connect_mail() pattern.
-        _user = os.getenv("EMAIL_USER", "").strip()
-        _pw   = os.getenv("EMAIL_PASS", "").strip()
         msg['From'] = _user
         msg['To']   = Config.ALERT_EMAIL
-        with smtplib.SMTP_SSL(Config.ALERT_SMTP_HOST, Config.ALERT_SMTP_PORT) as smtp:
-            smtp.login(_user, _pw)
-            smtp.send_message(msg)
-            del _pw
-            del _user
+
+        if Config.ALERT_USE_STARTTLS:
+            with smtplib.SMTP(
+                Config.ALERT_SMTP_HOST,
+                Config.ALERT_SMTP_PORT,
+                timeout=Config.SOCKET_TIMEOUT_SEC,
+            ) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.login(_user, _pw)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(
+                Config.ALERT_SMTP_HOST,
+                Config.ALERT_SMTP_PORT,
+                timeout=Config.SOCKET_TIMEOUT_SEC,
+            ) as smtp:
+                smtp.login(_user, _pw)
+                smtp.send_message(msg)
+
         log_info(f"Alert sent to {Config.ALERT_EMAIL}")
     except Exception as e:
         log_error(f"Failed to send alert email: {e}")
+    finally:
+        # Remove local references on all exit paths — including exceptions.
+        # CPython's refcount GC then deallocates the string objects promptly.
+        del _pw, _user
 
 
 # ---------------------------------------------------------------------------
 # Main application loop
 # ---------------------------------------------------------------------------
 
-def main(retry_failed: bool = False) -> None:
-    """Main application loop."""
+def main(retry_failed: bool = False) -> int:
+    """Main application loop.
+
+    Returns:
+        0  — clean / expected exit (graceful shutdown, no emails left to retry).
+        1  — fatal exit (invalid credentials, max retries exhausted).
+    """
+    # Reset the shutdown event so that calling main() a second time in the same
+    # process (test suite, interactive shell) does not exit the loop immediately
+    # because a previous Ctrl+C left the event set.
+    _shutdown.clear()
+
     # Register signal handlers inside main() so that importing this module
     # (e.g. in the test suite) does not overwrite pytest's own SIGINT handler.
     signal.signal(signal.SIGINT, _handle_signal)
@@ -180,7 +215,7 @@ def main(retry_failed: bool = False) -> None:
         Config.validate()
     except ValueError as e:
         log_error(f"Configuration error: {e}")
-        return
+        return 1
 
     # Prevent duplicate instances from competing for the same IMAP connection
     # and DB records.  Exits immediately with a clear message if another instance
@@ -203,7 +238,15 @@ def main(retry_failed: bool = False) -> None:
     # hits MAX_RETRIES (alternating success / fail scenario).
     cumulative_errors = 0
 
-    while conn_error_count < Config.MAX_RETRIES and not _shutdown.is_set():
+    # One-shot flag: the degraded-state alert fires the first time cumulative
+    # errors reaches the threshold — without this, >= would spam alerts on
+    # every subsequent failure.
+    _degraded_alert_sent = False
+
+    # The failure exit is an explicit `return 1` inside the except block once
+    # conn_error_count reaches MAX_RETRIES — the while condition itself is only
+    # responsible for honouring a graceful-shutdown signal.
+    while not _shutdown.is_set():
         mail = None
 
         try:
@@ -230,15 +273,35 @@ def main(retry_failed: bool = False) -> None:
                 raise Exception(
                     f"IMAP SEARCH failed ({search_status}): {messages}"
                 )
-            email_ids = messages[0].split()
+            # Normalise to str immediately — imaplib returns byte UIDs
+            # (b'123', b'456').  Decoding once here prevents bytes vs. str
+            # mismatches in SQLite queries further down the pipeline where
+            # _decode_id() calls could otherwise be missed.
+            email_ids = [_decode_id(uid) for uid in messages[0].split()]
 
             log_info(f"Found {len(email_ids)} unseen emails")
+
+            # Per-cycle cap: prevents a burst inbox (first run, IMAP scope
+            # change, backlog) from running for hours and making the heartbeat
+            # go stale.  Remaining emails are picked up on subsequent cycles.
+            if Config.MAX_EMAILS_PER_CYCLE and len(email_ids) > Config.MAX_EMAILS_PER_CYCLE:
+                log_warning(
+                    f"Inbox has {len(email_ids)} unseen emails — capping this "
+                    f"cycle to {Config.MAX_EMAILS_PER_CYCLE} (MAX_EMAILS_PER_CYCLE). "
+                    f"Remaining {len(email_ids) - Config.MAX_EMAILS_PER_CYCLE} "
+                    f"will be processed in future cycles."
+                )
+                email_ids = email_ids[:Config.MAX_EMAILS_PER_CYCLE]
 
             for e_id in email_ids:
                 log_info(f"Processing Email ID: {_decode_id(e_id)}")
 
+                # Single query returns both status and retry_count — avoids the
+                # previous two-round-trip pattern (get_email_status then
+                # get_retry_count) which opened and closed two SQLite connections
+                # and left a brief inconsistency window between the two reads.
                 try:
-                    db_status = get_email_status(e_id)
+                    db_status, retry_count = get_email_record(e_id)
                 except Exception:
                     log_error(
                         f"DB check failed for {_decode_id(e_id)} "
@@ -259,7 +322,6 @@ def main(retry_failed: bool = False) -> None:
                     # marking it failed — the crash itself may have been
                     # transient (OOM, power loss, network drop).
                     # -------------------------------------------------------- #
-                    retry_count = get_retry_count(e_id)
                     if retry_count < Config.MAX_EMAIL_RETRIES:
                         mark_retry(e_id, "in_progress at startup — crash recovery")
                         log_warning(
@@ -286,8 +348,18 @@ def main(retry_failed: bool = False) -> None:
                     )
                     continue
 
-                # db_status is None (new email) or 'retry' (queued for re-attempt)
-                mark_in_progress(e_id)
+                # db_status is None (new email) or 'retry' (queued for re-attempt).
+                # Guard: if the DB write fails we must skip rather than process
+                # without a record — otherwise a mid-run crash produces a duplicate
+                # download with no in_progress marker for crash-recovery to detect.
+                try:
+                    mark_in_progress(e_id)
+                except Exception:
+                    log_error(
+                        f"Cannot record email {_decode_id(e_id)} as in_progress "
+                        f"— skipping to prevent double-processing on a DB failure"
+                    )
+                    continue
 
                 # Set the correlation ID for the duration of this email's processing.
                 # Every log_* call made inside process_email() (and any function it
@@ -308,15 +380,37 @@ def main(retry_failed: bool = False) -> None:
                     # email's log lines if an exception skips a normal code path.
                     clear_correlation_id()
 
-                if success:
-                    save_processed(e_id)
-                    log_info(
-                        f"Email {_decode_id(e_id)} processed successfully"
+                # Populate last_error_msg for the silent-False path (process_email
+                # returned False without raising).  Without this, last_error = NULL
+                # in the DB gives operators no clue why the email failed.
+                if not success and last_error_msg is None:
+                    last_error_msg = (
+                        "process_email returned False — "
+                        "check attachment_handler log lines for this email-id"
                     )
+
+                if success:
+                    try:
+                        save_processed(e_id)
+                    except Exception as db_err:
+                        # Attachment files were saved successfully; only the DB
+                        # write failed.  Log prominently — crash recovery will
+                        # see the email still in_progress on the next run and
+                        # promote it to 'retry', burning one retry slot, but no
+                        # data is lost and no duplicate download occurs.
+                        log_error(
+                            f"Email {_decode_id(e_id)} processed but DB mark-done "
+                            f"failed ({db_err}) — crash recovery will retry next run"
+                        )
+                    else:
+                        log_info(
+                            f"Email {_decode_id(e_id)} processed successfully"
+                        )
                 else:
-                    # Honour the per-email retry budget before giving up.
-                    # retry_count reflects how many attempts have already failed.
-                    retry_count = get_retry_count(e_id)
+                    # retry_count was fetched at the top of this loop iteration
+                    # (via get_email_record) — it reflects how many attempts have
+                    # already failed, which is exactly what we need here.
+                    # mark_retry increments it atomically in the DB.
                     if retry_count < Config.MAX_EMAIL_RETRIES:
                         mark_retry(e_id, last_error_msg)
                         log_warning(
@@ -358,7 +452,7 @@ def main(retry_failed: bool = False) -> None:
         except CredentialError as e:
             # CredentialError is raised by connect_mail() only when the IMAP
             # server explicitly rejects the login — no point retrying.
-            error_msg = str(e)
+            error_msg = _safe_error(str(e))
             log_error(f"Fatal credential error: {error_msg}")
             send_alert(
                 "EmailAssetcues — Fatal: Invalid credentials",
@@ -366,20 +460,48 @@ def main(retry_failed: bool = False) -> None:
                 f"Error: {error_msg}\n\n"
                 f"Fix EMAIL_USER / EMAIL_PASS in your .env file and restart."
             )
-            break
+            return 1
+
+        except QuotaError as e:
+            # IMAP server is rate-limiting or quota-throttling.  This is always
+            # transient — back off for _QUOTA_BACKOFF_SEC without incrementing
+            # conn_error_count so a temporary throttle never stops the app.
+            error_msg = _safe_error(str(e))
+            log_warning(
+                f"IMAP quota / throttle error — backing off "
+                f"{_QUOTA_BACKOFF_SEC}s before retry: {error_msg}"
+            )
+            _shutdown.wait(timeout=_QUOTA_BACKOFF_SEC)
+            # Loop continues — finally block closes the connection first.
 
         except Exception as e:
-            error_msg = str(e)
+            error_msg = _safe_error(str(e))
+
+            # ---------------------------------------------------------------- #
+            # Quota / rate-limit errors that arrive as generic Exceptions
+            # (e.g. SEARCH or FETCH failures that happen after a successful
+            # login) are treated the same as QuotaError from connect_mail().
+            # ---------------------------------------------------------------- #
+            if _QUOTA_RE.search(error_msg):
+                log_warning(
+                    f"IMAP quota / throttle detected in operation — backing off "
+                    f"{_QUOTA_BACKOFF_SEC}s before retry: {error_msg}"
+                )
+                _shutdown.wait(timeout=_QUOTA_BACKOFF_SEC)
+                # Loop continues — finally block closes the connection first.
+                continue
+
             log_exception(f"Connection error: {error_msg}")
 
             conn_error_count  += 1
             cumulative_errors += 1
 
-            # Degraded-state alert: fires when the total lifetime failure count
-            # reaches MAX_RETRIES * 2.  This catches the alternating success/fail
-            # pattern that never trips the consecutive MAX_RETRIES guard but
-            # still indicates a persistently unhealthy connection.
-            if cumulative_errors == Config.MAX_RETRIES * 2:
+            # Degraded-state alert: fires the first time cumulative errors
+            # reaches MAX_RETRIES * 2.  Using >= (not ==) so the alert is not
+            # skipped if the counter jumps past the threshold in one increment.
+            # The one-shot flag prevents alert spam on every subsequent failure.
+            if not _degraded_alert_sent and cumulative_errors >= Config.MAX_RETRIES * 2:
+                _degraded_alert_sent = True
                 send_alert(
                     f"EmailAssetcues — Degraded: {cumulative_errors} total connection failures",
                     f"The email processor has encountered {cumulative_errors} total "
@@ -401,7 +523,7 @@ def main(retry_failed: bool = False) -> None:
                     f"Please check your internet connection and IMAP server, "
                     f"then restart the app."
                 )
-                break
+                return 1
 
             # Exponential backoff — doubles on each failure, capped at 5 minutes.
             wait_time = min(
@@ -422,6 +544,9 @@ def main(retry_failed: bool = False) -> None:
                 except Exception as e:
                     log_error(f"Logout error: {e}")
 
+    # Clean exit — either graceful shutdown or the inbox is fully processed.
+    return 0
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Email Attachment Processor")
@@ -431,4 +556,7 @@ if __name__ == "__main__":
         help="Reset all previously-failed / retry-queued emails so they are retried this run"
     )
     args = parser.parse_args()
-    main(retry_failed=args.retry_failed)
+    # sys.exit() propagates the return code to the OS so run_worker.bat
+    # can distinguish a clean exit (0) from a fatal error (1) and decide
+    # whether to restart.  Without this both paths look identical to the watchdog.
+    sys.exit(main(retry_failed=args.retry_failed))

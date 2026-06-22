@@ -12,6 +12,8 @@ Keeping this module separate from main.py gives three benefits:
   3. A future swap to PostgreSQL (or SQLAlchemy) only touches this file.
 """
 
+from __future__ import annotations
+
 import sqlite3
 from contextlib import contextmanager
 
@@ -58,6 +60,27 @@ def init_db() -> None:
     """Initialize database and create / migrate table if needed."""
     try:
         with _db_conn() as conn:
+            # WAL (Write-Ahead Log) mode is strongly preferred over the default
+            # rollback-journal for an unattended 24/7 process:
+            #   • Readers never block writers; writers never block readers.
+            #   • A crash mid-write leaves the WAL file intact — SQLite replays
+            #     or discards it on next open, giving much safer crash recovery.
+            #   • Requires SQLite 3.7.0+ (2010), safe to assume on any modern OS.
+            # Must be set before any table DDL so the pragma takes effect on the
+            # first connection that creates the DB file.
+            # WAL mode — capture the return value so we can warn the operator
+            # if the filesystem silently fell back to DELETE mode (NFS, SMB,
+            # FAT32, and some Docker volume mounts do not support WAL).
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if row and row[0].lower() != 'wal':
+                log_info(
+                    f"SQLite WAL mode could not be enabled on this filesystem "
+                    f"(got '{row[0]}' instead of 'wal'). "
+                    f"The database will run in '{row[0]}' journal mode — "
+                    f"crash recovery will be less robust. "
+                    f"Move the database to a local filesystem to enable WAL."
+                )
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS processed (
                     email_id    TEXT PRIMARY KEY,
@@ -80,7 +103,7 @@ def init_db() -> None:
                 ('last_error',
                  "ALTER TABLE processed ADD COLUMN last_error TEXT"),
                 ('updated_at',
-                 "ALTER TABLE processed ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))"),
+                 "ALTER TABLE processed ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00'"),
             ]
             for col, ddl in migrations:
                 if col not in existing_columns:
@@ -101,6 +124,36 @@ def init_db() -> None:
 # ---------------------------------------------------------------------------
 # Status queries
 # ---------------------------------------------------------------------------
+
+def get_email_record(e_id) -> tuple:
+    """Return (status, retry_count) in a single query.
+
+    Replaces the two-call pattern get_email_status() + get_retry_count() with
+    one round-trip to SQLite — halves the number of file-lock acquire/release
+    cycles per email and eliminates the brief window between the two reads
+    where the row could theoretically be mutated by another process.
+
+    Returns:
+        (status_str, retry_count_int) if the email is in the DB.
+        (None, 0)                     if not found (new email).
+
+    Raises:
+        Exception: propagated to the caller for logging; the caller should
+                   skip the email rather than risk reprocessing.
+    """
+    try:
+        with _db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT status, retry_count FROM processed WHERE email_id = ?",
+                (_decode_id(e_id),)
+            )
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else (None, 0)
+    except Exception as e:
+        log_exception(f"Database record read error: {e}")
+        raise
+
 
 def get_email_status(e_id):
     """Return the current status string, or None if the email is not in the DB."""
@@ -143,6 +196,12 @@ def mark_in_progress(e_id) -> None:
 
     Uses an UPSERT so the function works for both new emails (INSERT) and
     emails being re-attempted after a 'retry' status (UPDATE).
+
+    Raises:
+        Exception: propagated to the caller if the DB write fails.
+                   The caller MUST skip the email rather than process it
+                   without an in_progress record — otherwise a mid-run crash
+                   leaves a downloaded file with no crash-recovery marker.
     """
     try:
         with _db_conn() as conn:
@@ -156,6 +215,7 @@ def mark_in_progress(e_id) -> None:
             )
     except Exception as e:
         log_exception(f"Database mark_in_progress error: {e}")
+        raise   # caller must handle — do not process without a DB record
 
 
 def save_processed(e_id) -> None:
@@ -210,11 +270,25 @@ def mark_failed(e_id, error_msg: str | None = None) -> None:
 
 
 def reset_failed_emails() -> None:
-    """Remove all failed and retry entries so they are re-attempted on next run."""
+    """Reset all failed and retry entries so they are re-attempted on next run.
+
+    Uses UPDATE rather than DELETE so the row's history (original email_id,
+    prior retry_count) is preserved in the database.  This lets operators
+    query how many total attempts have been made for a given email even after
+    a --retry-failed run, and prevents phantom "not found" lookups caused by
+    a missing row mid-cycle if another thread races the DELETE.
+    """
     try:
         with _db_conn() as conn:
             cur = conn.cursor()
-            cur.execute("DELETE FROM processed WHERE status IN ('failed', 'retry')")
+            cur.execute(
+                """UPDATE processed
+                   SET status      = 'retry',
+                       retry_count = 0,
+                       last_error  = NULL,
+                       updated_at  = datetime('now')
+                   WHERE status IN ('failed', 'retry')"""
+            )
             count = cur.rowcount
         log_info(
             f"Reset {count} failed/retry email(s) — they will be retried on next run"

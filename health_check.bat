@@ -11,12 +11,22 @@ if exist heartbeat.txt (
     set /p LAST_BEAT=<heartbeat.txt
     echo Last heartbeat : !LAST_BEAT!
 
-    :: Check staleness — warn if heartbeat is older than 2 minutes
+    :: Extract CHECK_INTERVAL_SEC from .env and calculate threshold
+    set CHECK_INTERVAL=30
+    if exist .env (
+        for /f "tokens=1,2 delims==" %%A in (.env) do (
+            if "%%A"=="CHECK_INTERVAL_SEC" set CHECK_INTERVAL=%%B
+        )
+    )
+    set /a MAX_AGE=!CHECK_INTERVAL! + 60
+
+    :: Check staleness — warn if heartbeat is older than MAX_AGE
     powershell -NoProfile -Command ^
         "$hb = Get-Content heartbeat.txt -Raw; " ^
         "$ts = [datetime]::ParseExact($hb.Trim(), 'yyyy-MM-dd HH:mm:ss', $null); " ^
         "$age = [int](New-TimeSpan -Start $ts -End (Get-Date)).TotalSeconds; " ^
-        "if ($age -gt 120) { Write-Host ('WARNING: Heartbeat is ' + $age + 's old — app may be stuck or down') } " ^
+        "$maxAge = !MAX_AGE!; " ^
+        "if ($age -gt $maxAge) { Write-Host ('WARNING: Heartbeat is ' + $age + 's old (Threshold: ' + $maxAge + 's) — app may be stuck or down') } " ^
         "else { Write-Host ('Heartbeat age    : ' + $age + 's  [OK]') }"
 ) else (
     echo WARNING: heartbeat.txt not found — app has not completed a cycle yet or is not running.

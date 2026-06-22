@@ -1,11 +1,35 @@
+from __future__ import annotations
+
+# Standard library — all imports before any module-level code (PEP 8 E402)
 import os
 import shutil
 import email
 import email.policy
 import re
 from email.utils import parseaddr
+
 from config import Config
 from logger import log_debug, log_info, log_warning, log_error, log_exception
+
+# ---------------------------------------------------------------------------
+# Compiled regex for Authentication-Results pass detection.
+#
+# Uses \b word boundaries so 'dkim=passthrough' (non-standard but theoretically
+# injectable) does NOT match 'dkim=pass'.  Without boundaries, a simple
+# substring check ('dkim=pass' in combined) would accept any value that merely
+# starts with 'pass', bypassing the authentication gate.
+#
+# Pattern: one of the three auth mechanisms followed by =pass and a word
+# boundary — meaning the next character must be non-alphanumeric (space,
+# semicolon, end-of-string) per RFC 7601 result-value syntax.
+#
+# Compiled once at module load; reused on every email checked.
+# re.IGNORECASE: Authentication-Results headers are case-insensitive.
+# ---------------------------------------------------------------------------
+_AUTH_PASS_RE = re.compile(
+    r'\b(?:dkim|spf|dmarc)=pass\b',
+    re.IGNORECASE,
+)
 
 # Maximum filename length (bytes) that NTFS and most filesystems support is 255.
 # We cap at 200 to leave room for the counter suffix (_1, _2, …) and the extension.
@@ -52,6 +76,7 @@ def sanitize_filename(filename: str) -> str:
     """
     filename = os.path.basename(filename)
     filename = filename.lstrip('.')                         # strip leading dots
+    filename = filename.rstrip('. ')                        # strip trailing dots and spaces to prevent extension bypass
     filename = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)  # replace unsafe chars
     filename = filename[:_MAX_FILENAME_LEN]                 # cap length
     return filename or 'unnamed_attachment'
@@ -129,13 +154,15 @@ def _check_disk_space() -> bool:
     return True
 
 
-def _check_email_size(mail, e_id) -> bool:
-    """Return True if the email is oversized and has already been handled.
+def _is_oversized_email(mail, e_id) -> bool:
+    """Return True if the email exceeds MAX_EMAIL_SIZE_MB and has been handled.
 
-    A True return means the caller should ``return True`` (consciously skipped,
-    not a failure).  False means the size is acceptable — continue processing.
+    True  → email was oversized; caller should ``return True`` (deliberate skip,
+            not a retryable failure — the email is marked Seen so it won't reappear).
+    False → size is acceptable; caller should continue processing.
 
-    Uses a lightweight RFC822.SIZE fetch instead of downloading the full body.
+    Uses a lightweight RFC822.SIZE fetch instead of downloading the full body
+    so we never allocate a large buffer only to discard it immediately.
     """
     size_status, size_data = mail.uid('FETCH', e_id, '(RFC822.SIZE)')
     if size_status == 'OK' and size_data[0]:
@@ -197,19 +224,76 @@ def _check_sender_allowed(msg, mail, e_id) -> bool:
     return True
 
 
+def _check_auth_headers(msg, mail, e_id) -> bool:
+    """Verify Authentication-Results when REQUIRE_SENDER_AUTH is enabled.
+
+    Authentication-Results is injected by the *receiving* mail server (Gmail,
+    Outlook, etc.) after it validates DKIM, SPF, and DMARC signatures.  Unlike
+    the From: header, it cannot be forged by the sender.
+
+    This check is only applied when REQUIRE_SENDER_AUTH=true AND ALLOWED_SENDERS
+    is non-empty — it acts as a second gate alongside the From: allowlist check,
+    preventing a spoofed From: header from bypassing sender-based access control.
+
+    If any Authentication-Results header on the message carries dkim=pass,
+    spf=pass, or dmarc=pass, the email is considered authenticated.
+
+    Returns True to continue processing, False if authentication failed and
+    the email was deliberately skipped (mark Seen so it does not reappear).
+    """
+    if not Config.REQUIRE_SENDER_AUTH or not Config.ALLOWED_SENDERS:
+        return True
+
+    # RFC 7601 §7.1: Authentication-Results headers are ordered chronologically.
+    # The LAST header is the one appended by the *receiving* mail server (Gmail,
+    # Outlook, etc.) after it verified DKIM/SPF/DMARC — it is authoritative.
+    #
+    # Joining ALL headers (the old approach) is exploitable: a malicious sender
+    # can prepend their own "Authentication-Results: attacker.com dkim=pass"
+    # before the message reaches the receiving server.  If that attacker-injected
+    # header survives delivery (not all servers strip it), the combined-string
+    # search returns a false positive and the sender bypasses the auth gate.
+    #
+    # Only inspecting the last header closes this bypass because the attacker
+    # cannot append headers after the receiving server has written its own.
+    auth_headers = msg.get_all('Authentication-Results') or []
+    last_header = auth_headers[-1] if auth_headers else ""
+
+    # _AUTH_PASS_RE uses \b word boundaries so 'dkim=passthrough' does NOT match.
+    authenticated = bool(_AUTH_PASS_RE.search(last_header))
+    if not authenticated:
+        _, sender_addr = parseaddr(msg.get('From', ''))
+        log_warning(
+            f"[REJECTED] Email from '{sender_addr}' failed sender authentication "
+            f"(no dkim=pass / spf=pass / dmarc=pass in Authentication-Results) "
+            f"— marking Seen and skipping. "
+            f"Set REQUIRE_SENDER_AUTH=false to disable this check."
+        )
+        seen_st, _ = mail.uid('STORE', e_id, '+FLAGS', '\\Seen')
+        if seen_st != 'OK':
+            log_warning(
+                f"Could not mark auth-rejected email {e_id} as Seen "
+                f"— it will reappear next cycle"
+            )
+        return False
+    return True
+
+
 def _save_attachment_part(part, e_id) -> str | None:
     """Run the full security pipeline on one MIME part and save it.
 
     Returns the saved filepath on success, or None if the attachment was
     blocked, had no payload, or had no filename.
 
-    Security checks in order (cheapest first):
+    Security checks in order (cheapest first — all pre-decode checks run
+    before the atomic placeholder is created so no ghost files accumulate):
       1. Filename present
       2. Filename sanitization
-      3. Extension blocklist
-      4. Content-Type blocklist
-      5. Atomic placeholder creation (TOCTOU-safe)
-      6. Magic byte check (requires decoded payload)
+      3. Extension blocklist            (fast frozenset lookup)
+      4. Content-Type blocklist         (fast frozenset lookup)
+      5. Per-attachment size estimate   (raw encoded length × 0.75, no decode)
+      6. Atomic placeholder creation    (TOCTOU-safe O_CREAT|O_EXCL)
+      7. Magic byte check               (requires decoded payload, checks first 8 bytes)
     """
     filename = part.get_filename()
     if not filename:
@@ -221,7 +305,7 @@ def _save_attachment_part(part, e_id) -> str | None:
 
     filename = sanitize_filename(filename)
 
-    # --- Guard 1: extension blocklist (fast path) ---
+    # --- Guard 3: extension blocklist (fast path) ---
     ext = os.path.splitext(filename)[1].lower()
     if ext in Config.BLOCKED_EXTENSIONS:
         log_warning(
@@ -230,7 +314,7 @@ def _save_attachment_part(part, e_id) -> str | None:
         )
         return None
 
-    # --- Guard 2: Content-Type blocklist ---
+    # --- Guard 4: Content-Type blocklist ---
     # Catches renamed executables that still advertise their real MIME type
     # (e.g. malware.exe → report.pdf with Content-Type: application/x-msdownload).
     content_type = part.get_content_type().lower()
@@ -241,7 +325,28 @@ def _save_attachment_part(part, e_id) -> str | None:
         )
         return None
 
+    # --- Guard 5: per-attachment size check (pre-decode) ---
+    # Checked BEFORE creating the atomic placeholder so we never pay the
+    # create-and-delete cost for attachments we immediately reject.
+    # base64 overhead is exactly 4/3: raw_chars × 0.75 ≈ decoded bytes.
+    # Only applied when MAX_ATTACHMENT_SIZE_MB > 0 (disabled by default).
+    if Config.MAX_ATTACHMENT_SIZE_MB > 0:
+        raw = part.get_payload()   # encoded string — no decode allocation yet
+        if isinstance(raw, str):
+            estimated_bytes = int(len(raw) * 0.75)
+            max_bytes = Config.MAX_ATTACHMENT_SIZE_MB * 1024 * 1024
+            if estimated_bytes > max_bytes:
+                log_warning(
+                    f"[SKIPPED] Attachment '{filename}' estimated decoded size "
+                    f"{estimated_bytes / (1024 * 1024):.1f} MB exceeds "
+                    f"MAX_ATTACHMENT_SIZE_MB={Config.MAX_ATTACHMENT_SIZE_MB} "
+                    f"— skipping. Raise MAX_ATTACHMENT_SIZE_MB in .env to allow."
+                )
+                return None   # placeholder was never created — nothing to clean up
+
     # Atomic placeholder — no TOCTOU between existence-check and creation.
+    # Created only after all cheap pre-checks pass so we never accumulate
+    # 0-byte ghost files for attachments that would be immediately rejected.
     filepath = os.path.join(Config.DOWNLOAD_FOLDER, filename)
     filepath = get_unique_filepath(filepath)
 
@@ -258,7 +363,7 @@ def _save_attachment_part(part, e_id) -> str | None:
         )
         return None
 
-    # --- Guard 3: magic bytes check ---
+    # --- Guard 7: magic bytes check ---
     # Catches executables renamed to bypass the extension blocklist
     # (e.g. malware.exe saved as invoice.pdf — MZ header gives it away).
     # Must run AFTER decoding the payload, BEFORE writing to disk.
@@ -289,12 +394,23 @@ def _finalize_email(mail, e_id, has_attachment_parts: bool, saved_files: list[st
     Label is only applied when at least one attachment was saved — we don't
     label emails whose attachments were all blocked by security policy.
 
-    Seen is always marked when the email had attachment parts — even if all
-    were blocked — so it does not reappear as unseen on the next cycle.
+    Seen is ALWAYS marked — even for emails with no attachments — so the
+    email never reappears in SEARCH UNSEEN on future cycles.  Without this,
+    no-attachment emails accumulate in the UNSEEN list unboundedly: every
+    cycle fetches and DB-skips them, wasting bandwidth proportional to inbox age.
 
     Returns False if an IMAP command fails (caller should retry later).
     """
     if not has_attachment_parts:
+        # No attachment MIME parts found — mark Seen so the IMAP UNSEEN list
+        # stays clean.  The email is already recorded as 'done' in SQLite by
+        # the caller; without marking Seen here IMAP keeps returning it forever.
+        seen_st, seen_resp = mail.uid('STORE', e_id, '+FLAGS', '\\Seen')
+        if seen_st != 'OK':
+            log_warning(
+                f"Could not mark no-attachment email {e_id} as Seen: {seen_resp} "
+                f"— it will reappear as UNSEEN next cycle"
+            )
         return True
 
     if Config.USE_GMAIL_LABELS and saved_files:
@@ -334,7 +450,7 @@ def process_email(mail, e_id) -> bool:
         if not _check_disk_space():
             return False
 
-        if _check_email_size(mail, e_id):
+        if _is_oversized_email(mail, e_id):
             return True   # consciously skipped — oversized
 
         msg_data = _fetch_email_body(mail, e_id)
@@ -364,6 +480,9 @@ def process_email(mail, e_id) -> bool:
             if not _check_sender_allowed(msg, mail, e_id):
                 return True   # consciously skipped — sender not in allowlist
 
+            if not _check_auth_headers(msg, mail, e_id):
+                return True   # consciously skipped — failed DKIM/SPF/DMARC check
+
             # ---------------------------------------------------------------- #
             # MIME bomb protection — cap the number of parts walked.
             # A legitimate email rarely has >20–30 MIME parts.  Stopping early
@@ -388,7 +507,18 @@ def process_email(mail, e_id) -> bool:
                 if filepath:
                     saved_files.append(filepath)
 
-        return _finalize_email(mail, e_id, has_attachment_parts, saved_files)
+        success = _finalize_email(mail, e_id, has_attachment_parts, saved_files)
+        if not success:
+            # IMAP finalisation failed — roll back all files saved this attempt
+            # so a retry starts with a clean slate and does not accumulate
+            # duplicate downloads (Invoice.pdf, Invoice_1.pdf, Invoice_2.pdf …).
+            for f in saved_files:
+                try:
+                    os.remove(f)
+                    log_info(f"Rolled back file before retry: {f}")
+                except OSError as cleanup_err:
+                    log_warning(f"Rollback failed for '{f}': {cleanup_err}")
+        return success
 
     except Exception as e:
         log_exception(f"Processing Error: {e}")

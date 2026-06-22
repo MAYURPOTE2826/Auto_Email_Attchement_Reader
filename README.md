@@ -8,7 +8,7 @@ Automated tool to download attachments from Gmail and organize them locally. Run
 - Automatically connects to Gmail via IMAP
 - Searches for unseen emails with attachments
 - Downloads and saves attachments with automatic filename sanitization
-- Prevents duplicate processing using SQLite with per-email status tracking (`done`, `in_progress`, `failed`)
+- Prevents duplicate processing using SQLite with per-email status tracking (`done`, `in_progress`, `retry`, `failed`)
 - Labels processed emails in Gmail (`Attachment_Mails`)
 - Marks emails as read after processing
 - Automatic retry on connection failures (configurable, default 5 retries)
@@ -18,14 +18,23 @@ Automated tool to download attachments from Gmail and organize them locally. Run
 - Interruptible sleep — shutdown signal wakes the wait immediately
 - Heartbeat file (`heartbeat.txt`) updated each cycle for external health monitoring
 
-**Safety Features:**
-- 20MB email size limit (configurable)
+**Safety & Security Features:**
+- 20MB email size limit (configurable); per-attachment size cap (`MAX_ATTACHMENT_SIZE_MB`)
 - 500MB minimum free disk space check (configurable)
-- Unique filenames to prevent overwrites
+- Unique filenames to prevent overwrites (TOCTOU-safe atomic creation)
 - Rotating log files (5MB max, 3 backups)
-- Transaction-safe database operations
+- Transaction-safe database operations (SQLite WAL mode)
 - `in_progress` status prevents duplicate downloads if app crashes mid-email
+- Per-email retry budget with automatic crash recovery (`MAX_EMAIL_RETRIES`)
 - Email alert when app stops unexpectedly (optional, via `ALERT_EMAIL`)
+- Degraded-state alert fires when cumulative connection failures reach `MAX_RETRIES × 2`
+- Single-instance lockfile (`app.lock`) — prevents two processes competing for the same DB and IMAP connection
+- Exponential backoff on consecutive connection failures (doubles per retry, capped at 5 min)
+- Magic byte signature detection — blocks renamed executables (MZ/ELF), shell scripts, and archives regardless of extension or MIME type
+- Sender authentication verification — enforces DKIM/SPF/DMARC pass for allowlisted senders (`REQUIRE_SENDER_AUTH`)
+- Per-cycle email cap (`MAX_EMAILS_PER_CYCLE`) — keeps heartbeat fresh even with a flooded inbox
+- Credential redaction — app-password patterns are scrubbed from alert email bodies before sending
+- Dedicated SMTP account for alerts (`ALERT_SMTP_USER`) — breaks the circular dependency when IMAP credentials fail
 
 **Windows Auto-Start:**
 - `run_worker.bat` — watchdog that auto-restarts `main.py` on crash
@@ -90,14 +99,17 @@ python main.py --retry-failed
 Clears all `failed` entries from the database so those emails are retried this run.
 
 ### Each cycle the app will:
-1. Connect to Gmail's IMAP server
+1. Connect to Gmail's (or any IMAP) server
 2. Search for unseen emails
 3. Skip already-processed emails (status `done` or `failed`)
-4. Download attachments to the `attachments/` folder
-5. Mark emails as processed
-6. Write a heartbeat timestamp to `heartbeat.txt`
-7. Wait (default 30 seconds) before checking again
-8. Repeat until stopped or max retries reached
+4. Cap batch size to `MAX_EMAILS_PER_CYCLE` (if set) to keep heartbeat fresh
+5. Validate sender against allowlist + DKIM/SPF/DMARC (if `REQUIRE_SENDER_AUTH=true`)
+6. Check magic bytes and extension/MIME blocklists before writing each file
+7. Download attachments to the `attachments/` folder
+8. Mark emails as processed; schedule transient failures for retry (`retry` status)
+9. Write a heartbeat timestamp to `heartbeat.txt`
+10. Wait (default 30 seconds) before checking again
+11. Repeat until stopped or max consecutive retries reached
 
 ### Check logs
 ```bash
@@ -144,18 +156,27 @@ schtasks /query /tn "EmailAssetcues"     # Check status
 All settings are set via environment variables in `.env`. See `.env.example` for a full template.
 
 ```env
-# Email Settings (required)
+# Email credentials (required)
 EMAIL_USER=your-email@gmail.com
 EMAIL_PASS=your-app-password
+
+# IMAP connection
 IMAP_SERVER=imap.gmail.com
 IMAP_PORT=993
 ATTACHMENT_INBOX=inbox
 
-# Email Processing
+# Set to false for non-Gmail IMAP servers (Outlook, Yahoo, self-hosted)
+# Disables Gmail's proprietary X-GM-LABELS extension
+USE_GMAIL_LABELS=true
+
+# Email processing
 MAX_EMAIL_SIZE_MB=20
 SOCKET_TIMEOUT_SEC=30
 
-# File Storage
+# Per-attachment size cap — 0 = disabled; example: 10 rejects any attachment > ~10 MB
+MAX_ATTACHMENT_SIZE_MB=0
+
+# File storage
 DOWNLOAD_FOLDER=attachments
 MAX_FILENAME_ATTEMPTS=100
 MIN_FREE_DISK_MB=500
@@ -169,34 +190,46 @@ LOG_MAX_BYTES=5242880
 LOG_BACKUP_COUNT=3
 LOG_LEVEL=INFO
 
-# Application Behavior
+# Set LOG_JSON=true for ELK / Datadog / CloudWatch ingestion
+LOG_JSON=false
+
+# Application behaviour
 CHECK_INTERVAL_SEC=30
 MAX_RETRIES=5
 RETRY_WAIT_SEC=10
 
-# Alerting — optional, sends an email when the app stops unexpectedly
+# Per-email retry budget (0 = fail immediately; default 3 = up to 4 total attempts)
+MAX_EMAIL_RETRIES=3
+
+# Per-cycle processing cap — 0 = unlimited; recommended 200-500 to keep heartbeat fresh
+MAX_EMAILS_PER_CYCLE=0
+
+# MIME bomb protection — cap on MIME parts parsed per email
+MAX_MIME_PARTS=200
+
+# Alerting — optional; sends an email when the app stops unexpectedly
 ALERT_EMAIL=
 ALERT_SMTP_HOST=smtp.gmail.com
 ALERT_SMTP_PORT=465
 
-# Logging — set LOG_JSON=true for ELK / Datadog / CloudWatch ingestion
-LOG_JSON=false
-
-# Per-email retry budget (0 = fail immediately, default 3 = up to 4 total attempts)
-MAX_EMAIL_RETRIES=3
-
-# MIME bomb protection — cap on MIME parts parsed per email
-MAX_MIME_PARTS=200
+# Dedicated SMTP account for alerts (recommended — avoids silent failure when IMAP creds break)
+# ALERT_SMTP_USER=alerts@yourdomain.com
+# ALERT_SMTP_PASS=alert-account-password
+ALERT_SMTP_USER=
 
 # Security — sender allowlist (empty = accept from anyone)
 # Example: ALLOWED_SENDERS=boss@company.com,accounts@vendor.com
 ALLOWED_SENDERS=
 
-# Security — blocked file extensions (comma-separated, with leading dot)
-BLOCKED_EXTENSIONS=.exe,.bat,.cmd,.com,.pif,.scr,.vbs,.js,.ps1,.msi,.jar,.lnk,.dll,.zip,.7z,.rar,.tar,.gz,.iso,.img,.dmg
+# Security — enforce DKIM/SPF/DMARC pass for allowlisted senders (closes From: spoofing bypass)
+# Only effective when ALLOWED_SENDERS is non-empty
+REQUIRE_SENDER_AUTH=false
 
-# Security — blocked MIME Content-Types
-BLOCKED_MIME_TYPES=application/x-msdownload,application/x-executable,application/x-sh,application/x-bat
+# Security — blocked file extensions (comma-separated, with leading dot)
+BLOCKED_EXTENSIONS=.exe,.bat,.cmd,.com,.pif,.scr,.vbs,.vbe,.js,.jse,.ws,.wsh,.hta,.ps1,.psm1,.psd1,.reg,.msi,.jar,.msc,.lnk,.dll,.cpl,.zip,.7z,.rar,.tar,.gz,.bz2,.xz,.iso,.img,.dmg
+
+# Security — blocked MIME Content-Types (defence-in-depth against renamed malware)
+BLOCKED_MIME_TYPES=application/x-msdownload,application/x-executable,application/x-sh,application/x-bat,application/x-msdos-program,application/x-dosexec,application/x-winexe,application/x-java-archive
 ```
 
 ---
@@ -207,10 +240,12 @@ BLOCKED_MIME_TYPES=application/x-msdownload,application/x-executable,application
 Email_Assetcues/
 ├── main.py                 # Main application loop, alerting, shutdown handling
 ├── db.py                   # SQLite database layer (status tracking, retry logic)
-├── email_reader.py         # Gmail IMAP connection
-├── attachment_handler.py   # Attachment processing & file handling
+├── email_reader.py         # Gmail/IMAP connection, CredentialError, QuotaError
+├── attachment_handler.py   # Attachment processing, magic-byte checks, file handling
 ├── logger.py               # Logging configuration (plain-text + JSON/NDJSON)
 ├── config.py               # Settings management (reads from .env)
+├── audit.py                # Deployment readiness checker (run once before go-live)
+├── test_email_processor.py # Unit / integration tests (pytest)
 ├── requirements.txt        # Python dependencies
 ├── .env                    # Credentials — DO NOT COMMIT
 ├── .env.example            # Template for .env
@@ -220,6 +255,7 @@ Email_Assetcues/
 ├── health_check.bat        # Diagnostic — heartbeat, task status, recent logs
 ├── attachments/            # Downloaded attachment files
 ├── processed_emails.db     # SQLite DB (tracks processed email status)
+├── app.lock                # PID lockfile — prevents duplicate instances
 ├── heartbeat.txt           # Timestamp of last completed cycle
 ├── app.log                 # Application logs
 └── worker.log              # Watchdog logs (start/restart/stop events)
@@ -232,14 +268,17 @@ Email_Assetcues/
 | Module | Function | Purpose |
 |--------|----------|---------|
 | **main.py** | `main(retry_failed)` | Main loop: check emails, process, retry |
-| **main.py** | `send_alert()` | Email alert on fatal errors |
-| **db.py** | `init_db()` | Create/migrate SQLite database schema |
-| **db.py** | `get_email_status()` | Returns `done`, `in_progress`, `failed`, or `None` |
+| **main.py** | `send_alert()` | Email alert on fatal/degraded errors |
+| **main.py** | `_acquire_instance_lock()` | Write PID lockfile; exit if another instance is alive |
+| **db.py** | `init_db()` | Create/migrate SQLite schema (WAL mode) |
+| **db.py** | `get_email_record()` | Returns `(status, retry_count)` in one query |
+| **db.py** | `get_email_status()` | Returns `done`, `in_progress`, `retry`, `failed`, or `None` |
 | **db.py** | `mark_in_progress()` | Mark email as started (crash guard) |
+| **db.py** | `mark_retry()` | Increment retry count and re-queue for next cycle |
 | **db.py** | `save_processed()` | Mark email as fully done |
 | **db.py** | `mark_failed()` | Mark email as permanently failed |
-| **db.py** | `reset_failed_emails()` | Clear failed/retry entries for reprocessing |
-| **email_reader.py** | `connect_mail()` | Connect to IMAP server, returns connection |
+| **db.py** | `reset_failed_emails()` | Reset failed/retry entries for reprocessing |
+| **email_reader.py** | `connect_mail()` | Connect to IMAP; raises `CredentialError` or `QuotaError` |
 | **attachment_handler.py** | `process_email()` | Orchestrate full attachment pipeline |
 | **attachment_handler.py** | `sanitize_filename()` | Sanitize filename (path traversal, dot-file safe) |
 | **attachment_handler.py** | `get_unique_filepath()` | Atomic unique filename (TOCTOU-safe) |
@@ -247,6 +286,9 @@ Email_Assetcues/
 ---
 
 ## Troubleshooting
+
+### Pre-launch check
+Run `python audit.py` once before going to production — it validates all config attributes, module imports, and security settings, and exits 0 (READY) or 1 (NOT READY) with a full report.
 
 ### "Email credentials missing in .env"
 Copy `.env.example` to `.env` and set `EMAIL_USER` and `EMAIL_PASS`.
@@ -269,7 +311,11 @@ Check write permissions on the `attachments/` folder.
 ```bash
 python main.py --retry-failed
 ```
+Resets all `failed` and `retry` entries to `retry` status — history (retry counts, last error) is preserved in the DB.
 Or manually delete `processed_emails.db` to reset everything (will re-download all emails).
+
+### Another instance is already running
+The app writes a PID lockfile (`app.lock`) on startup. If the previous process exited uncleanly, delete `app.lock` manually and restart.
 
 ### Task Scheduler not starting the app
 Run `setup_autostart.bat` as Administrator. Check status with:
@@ -350,5 +396,5 @@ This project is provided as-is for personal use.
 
 ---
 
-**Last Updated:** April 4, 2026
-**Version:** 1.2.0-production
+**Last Updated:** April 6, 2026
+**Version:** 1.3.0-production

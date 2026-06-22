@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest test_email_processor.py --tb=short -q)"
+    ]
+  }
+}

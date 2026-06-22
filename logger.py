@@ -25,6 +25,8 @@ Design decisions:
                            handlers are not added again; avoids N-times duplication
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -33,6 +35,12 @@ import sys
 import time
 from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
+
+try:
+    from concurrent_log_handler import ConcurrentRotatingFileHandler
+    _FileHandlerClass = ConcurrentRotatingFileHandler
+except ImportError:
+    _FileHandlerClass = RotatingFileHandler
 
 from config import Config
 
@@ -244,21 +252,13 @@ class _JsonFormatter(logging.Formatter):
 # Handlers
 # ---------------------------------------------------------------------------
 
-_file_handler = RotatingFileHandler(
+_file_handler = _FileHandlerClass(
     Config.LOG_FILE,
     maxBytes=Config.LOG_MAX_BYTES,
     backupCount=Config.LOG_BACKUP_COUNT,
     encoding="utf-8",   # non-ASCII email subjects (Cyrillic, CJK, emoji) are safe
     delay=True,         # defer open to first write — import succeeds even if the
                         # log directory hasn't been created by main.py yet
-    #
-    # NOTE — multi-process safety:
-    # RotatingFileHandler uses a threading.RLock (safe for threads in one
-    # process).  If two OS processes write to the same log file simultaneously
-    # (e.g. an overlap during a Task Scheduler restart), rotation can corrupt
-    # the file.  For multi-instance deployments consider:
-    #   pip install concurrent-log-handler
-    #   from concurrent_log_handler import ConcurrentRotatingFileHandler
 )
 
 # stdout — Docker / Kubernetes log collectors capture stdout by default.

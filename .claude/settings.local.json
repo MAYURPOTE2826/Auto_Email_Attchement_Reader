@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import os; print\\('EMAIL_PASS env:', repr\\(os.environ.get\\('EMAIL_PASS','not set'\\)\\)\\); print\\('EMAIL_USER env:', repr\\(os.environ.get\\('EMAIL_USER','not set'\\)\\)\\)\")",
+      "Bash(schtasks.exe /query /tn \"EmailAssetcues\" /fo LIST)"
+    ]
+  }
+}

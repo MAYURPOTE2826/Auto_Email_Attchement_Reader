@@ -27,10 +27,10 @@ echo [%date% %time%] Starting main.py... >> worker.log
 "%PYTHON_PATH%" main.py %*
 SET EXIT_CODE=%errorlevel%
 
-if %EXIT_CODE% == 0 (
+if "%EXIT_CODE%" == "0" (
     :: Clean exit — user sent shutdown signal or max retries exhausted gracefully.
     :: Do not restart; let the Task Scheduler handle the next boot start.
-    echo [%date% %time%] main.py exited cleanly (code 0). Watchdog stopping. >> worker.log
+    echo [%date% %time%] main.py exited cleanly code 0. Watchdog stopping. >> worker.log
     exit /b 0
 )
 

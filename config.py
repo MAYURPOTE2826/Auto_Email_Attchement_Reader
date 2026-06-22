@@ -7,6 +7,8 @@ Precedence (highest to lowest):
   2. Values in .env file (fallback for local development only)
 """
 
+from __future__ import annotations
+
 import os
 import warnings
 from dotenv import load_dotenv
@@ -141,12 +143,76 @@ class Config:
     ALERT_SMTP_HOST = os.getenv("ALERT_SMTP_HOST", "smtp.gmail.com")
     ALERT_SMTP_PORT = _int("ALERT_SMTP_PORT", 465, min_val=1, max_val=65535)
 
+    # Optional dedicated SMTP sender address for alert emails.
+    # When set, alert emails are sent from this address instead of EMAIL_USER.
+    # ALERT_SMTP_PASS (the corresponding password) is intentionally NOT cached
+    # here — it is read fresh from os.getenv() at send time, consistent with
+    # the EMAIL_PASS pattern.
+    #
+    # Why this matters: send_alert() is also called when IMAP credentials fail.
+    # If alert SMTP reuses the same credentials, the alert silently fails at the
+    # exact moment it is most needed.  Configuring a separate outbound account
+    # (e.g. a dedicated alerts@yourdomain.com mailbox) breaks the circular
+    # dependency so you still receive the notification when IMAP auth breaks.
+    ALERT_SMTP_USER: str | None = os.getenv("ALERT_SMTP_USER") or None
+
+    # Modern enterprise SMTP (e.g., Office 365) requires explicit TLS (STARTTLS)
+    # on port 587 instead of implicit SSL on port 465.
+    ALERT_USE_STARTTLS: bool = os.getenv("ALERT_USE_STARTTLS", "false").lower() == "true"
+
+    # ------------------------------------------------------------------ #
+    # Security — sender authentication header verification
+    #
+    # When True and ALLOWED_SENDERS is non-empty, each email must carry at
+    # least one of dkim=pass / spf=pass / dmarc=pass in the
+    # Authentication-Results header injected by the receiving mail server.
+    #
+    # Why this matters: ALLOWED_SENDERS checks the From: header, which any
+    # sender can forge.  Authentication-Results is written by your IMAP server
+    # (Gmail, Outlook, etc.) after it verifies DKIM/SPF/DMARC — the sender
+    # cannot forge it.  Enabling this flag closes the From: spoofing bypass.
+    #
+    # Default: False — opt-in so existing deployments are unaffected.
+    # Set REQUIRE_SENDER_AUTH=true in .env alongside a non-empty ALLOWED_SENDERS.
+    # ------------------------------------------------------------------ #
+    REQUIRE_SENDER_AUTH: bool = os.getenv("REQUIRE_SENDER_AUTH", "false").lower() == "true"
+
+    # ------------------------------------------------------------------ #
+    # Per-cycle email processing cap
+    #
+    # Limits the number of emails processed in a single cycle.  Without a cap,
+    # an inbox with thousands of unseen messages (e.g. first run against a full
+    # inbox, or an accidental IMAP scope change) would keep the processor busy
+    # for hours — during which the heartbeat goes stale and health_check.bat
+    # raises a false alarm, and the watchdog may restart the process mid-loop.
+    #
+    # Default: 0 = unlimited (backward compatible).
+    # Recommended: 200–500 to keep each cycle safely under the heartbeat window.
+    # ------------------------------------------------------------------ #
+    MAX_EMAILS_PER_CYCLE = _int("MAX_EMAILS_PER_CYCLE", 0, min_val=0)
+
     # ------------------------------------------------------------------ #
     # MIME bomb protection
     # A legitimate email rarely has more than 20–30 MIME parts; 200 is generous.
     # Raise only if your workflow involves intentionally complex MIME structures.
     # ------------------------------------------------------------------ #
     MAX_MIME_PARTS = _int("MAX_MIME_PARTS", 200, min_val=1)
+
+    # ------------------------------------------------------------------ #
+    # Per-attachment size limit
+    #
+    # MAX_EMAIL_SIZE_MB caps the entire message envelope.  This setting caps
+    # each individual MIME part *before* base64-decoding to avoid allocating
+    # a large in-process buffer only to reject the attachment afterwards.
+    #
+    # The check uses the raw (encoded) payload length as a conservative proxy:
+    # base64-encoded content is ~4/3 the decoded size, so the raw length
+    # multiplied by 0.75 gives a good estimate without a full decode.
+    #
+    # Default: 0 = disabled (backward compatible).
+    # Example: MAX_ATTACHMENT_SIZE_MB=10 rejects any single attachment > ~10 MB.
+    # ------------------------------------------------------------------ #
+    MAX_ATTACHMENT_SIZE_MB = _int("MAX_ATTACHMENT_SIZE_MB", 0, min_val=0)
 
     # ------------------------------------------------------------------ #
     # Security — sender allowlist and attachment extension blocklist
@@ -221,6 +287,18 @@ class Config:
             warnings.warn(
                 f"LOG_LEVEL={raw_level!r} is not a valid Python log level — "
                 f"falling back to INFO.  Valid choices: {sorted(_VALID_LOG_LEVELS)}",
+                stacklevel=2,
+            )
+
+        # Cross-check: REQUIRE_SENDER_AUTH only enforces authentication for
+        # senders already in ALLOWED_SENDERS.  Setting it true with an empty
+        # allowlist silently skips the check for every email — the operator
+        # gets no protection and no indication that the flag has no effect.
+        if Config.REQUIRE_SENDER_AUTH and not Config.ALLOWED_SENDERS:
+            warnings.warn(
+                "REQUIRE_SENDER_AUTH=true has no effect because ALLOWED_SENDERS "
+                "is empty — authentication is only enforced for allowlisted senders. "
+                "Either populate ALLOWED_SENDERS or set REQUIRE_SENDER_AUTH=false.",
                 stacklevel=2,
             )
 

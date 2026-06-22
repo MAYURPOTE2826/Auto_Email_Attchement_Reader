@@ -19,6 +19,10 @@ processed_emails.txt
 *.sqlite
 *.sqlite3
 
+# Runtime
+app.lock
+audit.py
+
 # Test cache
 .pytest_cache/
 

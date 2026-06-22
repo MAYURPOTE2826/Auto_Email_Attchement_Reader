@@ -1,1 +1,2 @@
 python-dotenv==1.0.0
+concurrent-log-handler==0.9.25
