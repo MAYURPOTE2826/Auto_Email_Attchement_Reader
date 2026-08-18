@@ -1,400 +1,963 @@
-# Email Attachment Processor
+# 📧 Email Attachment Processor
 
-Automated tool to download attachments from Gmail and organize them locally. Runs continuously, checks for new emails on a configurable interval, and saves attachments with automatic deduplication. Designed for unattended 24/7 operation on Windows.
+<div align="center">
 
-## Features
+# 🚀 Email Attachment Processor
 
-**Core Features:**
-- Automatically connects to Gmail via IMAP
-- Searches for unseen emails with attachments
-- Downloads and saves attachments with automatic filename sanitization
-- Prevents duplicate processing using SQLite with per-email status tracking (`done`, `in_progress`, `retry`, `failed`)
-- Labels processed emails in Gmail (`Attachment_Mails`)
-- Marks emails as read after processing
-- Automatic retry on connection failures (configurable, default 5 retries)
-- Detailed logging to `app.log` with rotating log files
-- 30-second timeout on network connections to prevent hanging
-- Graceful shutdown on `Ctrl+C` or `SIGTERM` — finishes current email before stopping
-- Interruptible sleep — shutdown signal wakes the wait immediately
-- Heartbeat file (`heartbeat.txt`) updated each cycle for external health monitoring
+### Automated Gmail Attachment Downloader & Production-Ready Email Worker
 
-**Safety & Security Features:**
-- 20MB email size limit (configurable); per-attachment size cap (`MAX_ATTACHMENT_SIZE_MB`)
-- 500MB minimum free disk space check (configurable)
-- Unique filenames to prevent overwrites (TOCTOU-safe atomic creation)
-- Rotating log files (5MB max, 3 backups)
-- Transaction-safe database operations (SQLite WAL mode)
-- `in_progress` status prevents duplicate downloads if app crashes mid-email
-- Per-email retry budget with automatic crash recovery (`MAX_EMAIL_RETRIES`)
-- Email alert when app stops unexpectedly (optional, via `ALERT_EMAIL`)
-- Degraded-state alert fires when cumulative connection failures reach `MAX_RETRIES × 2`
-- Single-instance lockfile (`app.lock`) — prevents two processes competing for the same DB and IMAP connection
-- Exponential backoff on consecutive connection failures (doubles per retry, capped at 5 min)
-- Magic byte signature detection — blocks renamed executables (MZ/ELF), shell scripts, and archives regardless of extension or MIME type
-- Sender authentication verification — enforces DKIM/SPF/DMARC pass for allowlisted senders (`REQUIRE_SENDER_AUTH`)
-- Per-cycle email cap (`MAX_EMAILS_PER_CYCLE`) — keeps heartbeat fresh even with a flooded inbox
-- Credential redaction — app-password patterns are scrubbed from alert email bodies before sending
-- Dedicated SMTP account for alerts (`ALERT_SMTP_USER`) — breaks the circular dependency when IMAP credentials fail
+A reliable **24/7 Windows automation service** that continuously monitors Gmail/IMAP inboxes, detects emails containing attachments, securely downloads and organizes those attachments, tracks processing state with SQLite, automatically retries failures, and recovers from crashes.
 
-**Windows Auto-Start:**
-- `run_worker.bat` — watchdog that auto-restarts `main.py` on crash
-- `setup_autostart.bat` — registers the watchdog with Windows Task Scheduler (runs on boot)
-- `health_check.bat` — diagnostic tool to check heartbeat, task status, and recent logs
+<br/>
+
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge\&logo=python\&logoColor=white)
+![Gmail](https://img.shields.io/badge/Gmail-IMAP-EA4335?style=for-the-badge\&logo=gmail\&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge\&logo=sqlite\&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge\&logo=windows\&logoColor=white)
+
+<br/>
+
+**Automate → Download → Validate → Track → Retry → Monitor**
+
+</div>
 
 ---
 
-## Installation
+# 🌟 Overview
 
-### Prerequisites
-- Python 3.8 or higher
-- Gmail account with IMAP enabled
-- Gmail App Password (not your account password)
+**Email Attachment Processor** is an automated background worker designed to continuously monitor a Gmail or other IMAP inbox and download email attachments without manual intervention.
 
-### Setup Steps
+The application is designed for **unattended 24/7 operation on Windows**.
 
-1. **Clone or download the project**
-   ```bash
-   cd Email_Assetcues
-   ```
+It automatically:
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+* Connects to Gmail through IMAP
+* Finds unseen emails containing attachments
+* Validates incoming files
+* Downloads attachments safely
+* Prevents duplicate processing
+* Tracks email processing state
+* Applies Gmail labels
+* Marks processed emails as read
+* Retries temporary failures
+* Maintains heartbeat monitoring
+* Generates rotating logs
+* Recovers from crashes
+* Automatically restarts through a Windows watchdog
 
-3. **Configure credentials**
-
-   Copy `.env.example` to `.env` and fill in your credentials:
-   ```bash
-   copy .env.example .env
-   ```
-   ```env
-   EMAIL_USER=your-email@gmail.com
-   EMAIL_PASS=your-app-password
-   ```
-
-   **To get a Gmail App Password:**
-   - Enable 2-Factor Authentication on your Google account
-   - Go to https://myaccount.google.com/apppasswords
-   - Select "Mail" and "Windows Computer"
-   - Copy the generated 16-character password into `.env`
-
-4. **Register for auto-start on boot (optional but recommended)**
-   - Right-click `setup_autostart.bat` → **Run as administrator**
-   - The processor will now start automatically every time Windows boots
+The project is designed with **reliability, security, fault tolerance, and production operation** in mind.
 
 ---
 
-## Usage
+# 🎯 Problem Statement
 
-### Run manually
+Manually downloading email attachments becomes inefficient when an organization receives files continuously.
+
+Typical problems include:
+
+```text
+📩 New Email
+   ↓
+👤 Manual Checking
+   ↓
+📎 Find Attachment
+   ↓
+⬇️ Download File
+   ↓
+📁 Organize File
+   ↓
+❌ Risk of Duplicate Download
+   ↓
+🔁 Repeat Manually
+```
+
+This project automates the entire workflow:
+
+```text
+📩 Email Arrives
+      ↓
+🤖 Processor Detects Email
+      ↓
+🔍 Validate Email & Attachment
+      ↓
+🛡️ Security Checks
+      ↓
+⬇️ Download Attachment
+      ↓
+🗄️ Store Processing Status
+      ↓
+🏷️ Label Email
+      ↓
+✅ Mark As Read
+      ↓
+💓 Update Heartbeat
+      ↓
+🔄 Check Again
+```
+
+---
+
+# ✨ Core Features
+
+## 📬 Automatic Email Monitoring
+
+The worker continuously connects to Gmail or another IMAP-compatible mail server and searches for unseen emails with attachments.
+
+The default processing cycle runs every **30 seconds**.
+
+---
+
+## 📎 Automatic Attachment Download
+
+Attachments are automatically downloaded into the configured `attachments/` directory.
+
+The system also sanitizes filenames and generates unique paths to prevent accidental overwrites.
+
+---
+
+## 🗄️ SQLite Processing Database
+
+Every email is tracked using SQLite.
+
+Processing states include:
+
+```text
+        ┌──────────────┐
+        │   NEW EMAIL  │
+        └──────┬───────┘
+               ↓
+        ┌──────────────┐
+        │ IN_PROGRESS  │
+        └──────┬───────┘
+          ┌────┴────┐
+          ↓         ↓
+       SUCCESS    FAILURE
+          ↓         ↓
+        DONE      RETRY
+                    ↓
+                FAILED
+```
+
+This prevents duplicate downloads and allows the application to recover after crashes.
+
+---
+
+# 🛡️ Security Architecture
+
+Security is one of the major design goals of this project.
+
+## 🔒 File Size Protection
+
+The system supports:
+
+* Email size limits
+* Per-attachment size limits
+* Minimum free disk space checks
+
+The default email-size limit is **20 MB**, with configurable attachment limits and a **500 MB minimum free disk-space check**.
+
+---
+
+## 🦠 Malware-Oriented File Validation
+
+The application does not blindly trust file extensions.
+
+It performs **magic-byte signature detection** to detect potentially dangerous files even when their extension or MIME type has been manipulated.
+
+Blocked signatures include examples such as:
+
+```text
+MZ
+ELF
+Shell scripts
+Archives
+```
+
+This helps protect against files that attempt to disguise their real format.
+
+---
+
+## 🚫 Extension & MIME Blocking
+
+Configurable blocked extensions include dangerous executable/script formats such as:
+
+```text
+.exe
+.bat
+.cmd
+.ps1
+.js
+.vbs
+.msi
+.dll
+.jar
+```
+
+The application also supports MIME-type blocklists as an additional layer of defense.
+
+---
+
+# 🔐 Sender Authentication
+
+For allowlisted senders, the application can enforce:
+
+```text
+DKIM
+ +
+SPF
+ +
+DMARC
+```
+
+This helps protect against sender spoofing and unauthorized email sources.
+
+Configuration:
+
+```env
+ALLOWED_SENDERS=
+REQUIRE_SENDER_AUTH=false
+```
+
+---
+
+# 🔁 Fault Tolerance & Retry System
+
+Temporary network or email-processing failures should not stop the worker.
+
+The system implements:
+
+* Connection retries
+* Per-email retry budgets
+* Exponential backoff
+* Crash recovery
+* `in_progress` protection
+* Failed-email retry mode
+
+The connection retry mechanism can be configured through:
+
+```env
+MAX_RETRIES=5
+RETRY_WAIT_SEC=10
+```
+
+and per-email retry behavior through:
+
+```env
+MAX_EMAIL_RETRIES=3
+```
+
+---
+
+# ⚡ Exponential Backoff
+
+When consecutive connection failures occur, the application increases the waiting time between retries.
+
+```text
+Failure #1
+   ↓
+Wait
+   ↓
+Failure #2
+   ↓
+Longer Wait
+   ↓
+Failure #3
+   ↓
+Even Longer Wait
+   ↓
+Maximum 5 Minutes
+```
+
+This prevents aggressive repeated connection attempts during outages.
+
+---
+
+# 💓 Heartbeat Monitoring
+
+The application writes a timestamp to:
+
+```text
+heartbeat.txt
+```
+
+after each completed processing cycle.
+
+This allows an external monitoring system or administrator to determine whether the worker is still alive.
+
+```text
+Worker
+  ↓
+Process Emails
+  ↓
+Complete Cycle
+  ↓
+Update heartbeat.txt
+  ↓
+Wait
+  ↓
+Repeat
+```
+
+---
+
+# 📊 Logging System
+
+The application provides detailed logs through:
+
+```text
+app.log
+```
+
+Logs use rotating files to prevent unlimited disk growth.
+
+Default configuration:
+
+```env
+LOG_FILE=app.log
+LOG_MAX_BYTES=5242880
+LOG_BACKUP_COUNT=3
+LOG_LEVEL=INFO
+```
+
+JSON/NDJSON logging can also be enabled for log ingestion systems such as ELK, Datadog, or CloudWatch.
+
+---
+
+# 🚨 Alerting System
+
+The application can send email alerts when:
+
+* The worker stops unexpectedly
+* Connection failures reach the degraded-state threshold
+* Critical errors occur
+
+A dedicated SMTP account can be configured for alerts, preventing the alerting mechanism from depending on the same IMAP credentials that may have failed.
+
+---
+
+# 🔐 Single Instance Protection
+
+The application creates:
+
+```text
+app.lock
+```
+
+This prevents multiple instances of the processor from running simultaneously and competing for the same:
+
+* SQLite database
+* IMAP connection
+* Email processing queue
+
+This is particularly important for Windows auto-start environments.
+
+---
+
+# 🪟 Windows Auto-Start
+
+The project is designed for continuous Windows operation.
+
+It includes three important batch files:
+
+| File                  | Purpose                                          |
+| --------------------- | ------------------------------------------------ |
+| `setup_autostart.bat` | Registers the worker with Windows Task Scheduler |
+| `run_worker.bat`      | Watchdog that automatically restarts the worker  |
+| `health_check.bat`    | Checks heartbeat, task status, and logs          |
+
+---
+
+# 🔄 Production Boot Flow
+
+```text
+                    WINDOWS BOOTS
+                          │
+                          ▼
+                 Windows Task Scheduler
+                          │
+                          ▼
+                 setup_autostart.bat
+                          │
+                          ▼
+                   run_worker.bat
+                          │
+                          ▼
+                      main.py
+                          │
+                 ┌────────┴────────┐
+                 │                 │
+              Running            Crash
+                 │                 │
+                 │                 ▼
+                 │          Automatic Restart
+                 │
+                 ▼
+             Email Worker
+                 │
+                 ▼
+          Continuous Operation
+```
+
+The watchdog automatically launches `main.py` and restarts it if it crashes.
+
+---
+
+# 🔄 Complete Processing Workflow
+
+Every processing cycle follows this pipeline:
+
+```text
+┌──────────────────────────┐
+│ Connect to IMAP Server   │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Find Unseen Emails       │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Check Processing Status   │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Sender Authentication     │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ File Security Validation  │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Download Attachment       │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Save Processing Status    │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Apply Gmail Label        │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Mark Email As Read       │
+└─────────────┬────────────┘
+              ↓
+┌──────────────────────────┐
+│ Update Heartbeat         │
+└─────────────┬────────────┘
+              ↓
+             WAIT
+              ↓
+           REPEAT
+```
+
+The documented processing cycle explicitly includes IMAP connection, unseen-email search, duplicate checks, sender validation, magic-byte validation, attachment download, status updates, heartbeat writing, and repeated polling.
+
+---
+
+# 🧰 Technology Stack
+
+### Programming
+
+* Python 3.8+
+
+### Email
+
+* Gmail IMAP
+* IMAP protocol
+* SMTP for alerting
+
+### Database
+
+* SQLite
+* SQLite WAL mode
+
+### Automation
+
+* Windows Task Scheduler
+* Batch scripting
+* Watchdog process
+
+### Reliability
+
+* Retry mechanism
+* Exponential backoff
+* Heartbeat monitoring
+* Lockfile
+* Graceful shutdown
+
+### Security
+
+* Magic-byte detection
+* MIME validation
+* Extension blocklists
+* DKIM/SPF/DMARC verification
+* Credential redaction
+* File-size limits
+
+---
+
+# 📁 Project Structure
+
+```text
+Email_Assetcues/
+│
+├── main.py
+│   └── Main application loop
+│
+├── db.py
+│   └── SQLite database & retry state management
+│
+├── email_reader.py
+│   └── Gmail / IMAP connection
+│
+├── attachment_handler.py
+│   └── Attachment validation & downloading
+│
+├── logger.py
+│   └── Logging configuration
+│
+├── config.py
+│   └── Environment configuration
+│
+├── audit.py
+│   └── Deployment readiness checker
+│
+├── test_email_processor.py
+│   └── Tests
+│
+├── requirements.txt
+│
+├── .env.example
+│
+├── .gitignore
+│
+├── run_worker.bat
+│
+├── setup_autostart.bat
+│
+├── health_check.bat
+│
+├── attachments/
+│   └── Downloaded files
+│
+├── processed_emails.db
+│   └── Email processing state
+│
+├── app.lock
+│   └── Single-instance protection
+│
+├── heartbeat.txt
+│   └── Worker health timestamp
+│
+├── app.log
+│   └── Application logs
+│
+└── worker.log
+    └── Watchdog logs
+```
+
+The actual project structure and module responsibilities are documented in the source README.
+
+---
+
+# ⚙️ Installation
+
+## 1️⃣ Clone the Repository
+
+```bash
+git clone <YOUR_GITHUB_REPOSITORY_URL>
+
+cd Email_Assetcues
+```
+
+---
+
+## 2️⃣ Install Python Dependencies
+
+Python **3.8 or higher** is required.
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+# 🔐 Configure Gmail
+
+Create a `.env` file using `.env.example`.
+
+```bash
+copy .env.example .env
+```
+
+Then configure:
+
+```env
+EMAIL_USER=your-email@gmail.com
+EMAIL_PASS=your-app-password
+```
+
+The application requires a **Gmail App Password**, not the normal Google account password.
+
+---
+
+# 🔑 Gmail App Password Setup
+
+1. Enable 2-Factor Authentication.
+2. Open Google Account security settings.
+3. Create an App Password.
+4. Use the generated password in `.env`.
+5. Never commit `.env` to GitHub.
+
+---
+
+# ▶️ Run the Application
+
+Start the processor manually:
+
 ```bash
 python main.py
 ```
 
-### Run with failed-email retry
+To retry previously failed emails:
+
 ```bash
 python main.py --retry-failed
 ```
-Clears all `failed` entries from the database so those emails are retried this run.
-
-### Each cycle the app will:
-1. Connect to Gmail's (or any IMAP) server
-2. Search for unseen emails
-3. Skip already-processed emails (status `done` or `failed`)
-4. Cap batch size to `MAX_EMAILS_PER_CYCLE` (if set) to keep heartbeat fresh
-5. Validate sender against allowlist + DKIM/SPF/DMARC (if `REQUIRE_SENDER_AUTH=true`)
-6. Check magic bytes and extension/MIME blocklists before writing each file
-7. Download attachments to the `attachments/` folder
-8. Mark emails as processed; schedule transient failures for retry (`retry` status)
-9. Write a heartbeat timestamp to `heartbeat.txt`
-10. Wait (default 30 seconds) before checking again
-11. Repeat until stopped or max consecutive retries reached
-
-### Check logs
-```bash
-# Windows PowerShell
-Get-Content app.log -Wait
-
-# Windows Command Prompt
-type app.log
-```
 
 ---
 
-## Windows Auto-Start (Production)
+# 🪟 Enable Windows Auto-Start
 
-Three batch files manage the production lifecycle:
+For production-style operation:
 
-| File | Purpose | How to run |
-|------|---------|------------|
-| `setup_autostart.bat` | Registers the app with Task Scheduler to start on every boot | Run as Administrator (once) |
-| `run_worker.bat` | Watchdog — launches `main.py` and auto-restarts it if it crashes | Launched automatically by Task Scheduler |
-| `health_check.bat` | Shows heartbeat age, task status, and recent watchdog log | Double-click anytime |
+### Step 1
 
-**Boot flow:**
-```
-Windows boots
-  → Task Scheduler (after 1-minute delay)
-      → run_worker.bat  (watchdog)
-          → main.py  (email processor)
-              → auto-restarts on crash, stops on clean exit
+Right-click:
+
+```text
+setup_autostart.bat
 ```
 
-**Useful Task Scheduler commands:**
-```bat
-schtasks /run /tn "EmailAssetcues"       # Start now
-schtasks /end /tn "EmailAssetcues"       # Stop
-schtasks /delete /tn "EmailAssetcues" /f # Remove
-schtasks /query /tn "EmailAssetcues"     # Check status
+### Step 2
+
+Select:
+
+```text
+Run as administrator
 ```
+
+### Step 3
+
+The application will be registered with Windows Task Scheduler and automatically start when Windows boots.
 
 ---
 
-## Configuration
+# 🩺 Health Check
 
-All settings are set via environment variables in `.env`. See `.env.example` for a full template.
+Run:
+
+```text
+health_check.bat
+```
+
+It provides information about:
+
+* Heartbeat age
+* Task Scheduler status
+* Recent logs
+* Worker health
+
+This makes diagnosing an unattended worker significantly easier.
+
+---
+
+# ⚙️ Configuration
+
+The application is highly configurable through `.env`.
+
+Important settings include:
 
 ```env
-# Email credentials (required)
-EMAIL_USER=your-email@gmail.com
-EMAIL_PASS=your-app-password
+# Email
+EMAIL_USER=
+EMAIL_PASS=
 
-# IMAP connection
+# IMAP
 IMAP_SERVER=imap.gmail.com
 IMAP_PORT=993
-ATTACHMENT_INBOX=inbox
 
-# Set to false for non-Gmail IMAP servers (Outlook, Yahoo, self-hosted)
-# Disables Gmail's proprietary X-GM-LABELS extension
-USE_GMAIL_LABELS=true
-
-# Email processing
+# Processing
 MAX_EMAIL_SIZE_MB=20
-SOCKET_TIMEOUT_SEC=30
-
-# Per-attachment size cap — 0 = disabled; example: 10 rejects any attachment > ~10 MB
 MAX_ATTACHMENT_SIZE_MB=0
+CHECK_INTERVAL_SEC=30
 
-# File storage
+# Storage
 DOWNLOAD_FOLDER=attachments
-MAX_FILENAME_ATTEMPTS=100
 MIN_FREE_DISK_MB=500
 
 # Database
 DATABASE_PATH=processed_emails.db
 
-# Logging
-LOG_FILE=app.log
-LOG_MAX_BYTES=5242880
-LOG_BACKUP_COUNT=3
-LOG_LEVEL=INFO
-
-# Set LOG_JSON=true for ELK / Datadog / CloudWatch ingestion
-LOG_JSON=false
-
-# Application behaviour
-CHECK_INTERVAL_SEC=30
+# Retry
 MAX_RETRIES=5
 RETRY_WAIT_SEC=10
-
-# Per-email retry budget (0 = fail immediately; default 3 = up to 4 total attempts)
 MAX_EMAIL_RETRIES=3
 
-# Per-cycle processing cap — 0 = unlimited; recommended 200-500 to keep heartbeat fresh
+# Processing limit
 MAX_EMAILS_PER_CYCLE=0
 
-# MIME bomb protection — cap on MIME parts parsed per email
-MAX_MIME_PARTS=200
+# Logging
+LOG_LEVEL=INFO
 
-# Alerting — optional; sends an email when the app stops unexpectedly
-ALERT_EMAIL=
-ALERT_SMTP_HOST=smtp.gmail.com
-ALERT_SMTP_PORT=465
-
-# Dedicated SMTP account for alerts (recommended — avoids silent failure when IMAP creds break)
-# ALERT_SMTP_USER=alerts@yourdomain.com
-# ALERT_SMTP_PASS=alert-account-password
-ALERT_SMTP_USER=
-
-# Security — sender allowlist (empty = accept from anyone)
-# Example: ALLOWED_SENDERS=boss@company.com,accounts@vendor.com
+# Security
 ALLOWED_SENDERS=
-
-# Security — enforce DKIM/SPF/DMARC pass for allowlisted senders (closes From: spoofing bypass)
-# Only effective when ALLOWED_SENDERS is non-empty
 REQUIRE_SENDER_AUTH=false
+```
 
-# Security — blocked file extensions (comma-separated, with leading dot)
-BLOCKED_EXTENSIONS=.exe,.bat,.cmd,.com,.pif,.scr,.vbs,.vbe,.js,.jse,.ws,.wsh,.hta,.ps1,.psm1,.psd1,.reg,.msi,.jar,.msc,.lnk,.dll,.cpl,.zip,.7z,.rar,.tar,.gz,.bz2,.xz,.iso,.img,.dmg
+The complete configuration is documented in the project's `.env` settings.
 
-# Security — blocked MIME Content-Types (defence-in-depth against renamed malware)
-BLOCKED_MIME_TYPES=application/x-msdownload,application/x-executable,application/x-sh,application/x-bat,application/x-msdos-program,application/x-dosexec,application/x-winexe,application/x-java-archive
+---
+
+# 📊 Performance
+
+The project is designed to operate as a lightweight background worker.
+
+Documented baseline characteristics:
+
+```text
+Memory  → ~50 MB
+CPU     → Minimal
+Polling → Every 30 seconds
+Network → ~1 KB per email check + attachment size
+Storage → Depends on downloaded attachments
 ```
 
 ---
 
-## Project Structure
+# 🧪 Testing & Deployment Readiness
 
-```
-Email_Assetcues/
-├── main.py                 # Main application loop, alerting, shutdown handling
-├── db.py                   # SQLite database layer (status tracking, retry logic)
-├── email_reader.py         # Gmail/IMAP connection, CredentialError, QuotaError
-├── attachment_handler.py   # Attachment processing, magic-byte checks, file handling
-├── logger.py               # Logging configuration (plain-text + JSON/NDJSON)
-├── config.py               # Settings management (reads from .env)
-├── audit.py                # Deployment readiness checker (run once before go-live)
-├── test_email_processor.py # Unit / integration tests (pytest)
-├── requirements.txt        # Python dependencies
-├── .env                    # Credentials — DO NOT COMMIT
-├── .env.example            # Template for .env
-├── .gitignore              # Git ignore rules
-├── run_worker.bat          # Watchdog wrapper (auto-restart on crash)
-├── setup_autostart.bat     # Register watchdog with Windows Task Scheduler
-├── health_check.bat        # Diagnostic — heartbeat, task status, recent logs
-├── attachments/            # Downloaded attachment files
-├── processed_emails.db     # SQLite DB (tracks processed email status)
-├── app.lock                # PID lockfile — prevents duplicate instances
-├── heartbeat.txt           # Timestamp of last completed cycle
-├── app.log                 # Application logs
-└── worker.log              # Watchdog logs (start/restart/stop events)
-```
+Before deploying, the project includes:
 
----
-
-## Key Functions
-
-| Module | Function | Purpose |
-|--------|----------|---------|
-| **main.py** | `main(retry_failed)` | Main loop: check emails, process, retry |
-| **main.py** | `send_alert()` | Email alert on fatal/degraded errors |
-| **main.py** | `_acquire_instance_lock()` | Write PID lockfile; exit if another instance is alive |
-| **db.py** | `init_db()` | Create/migrate SQLite schema (WAL mode) |
-| **db.py** | `get_email_record()` | Returns `(status, retry_count)` in one query |
-| **db.py** | `get_email_status()` | Returns `done`, `in_progress`, `retry`, `failed`, or `None` |
-| **db.py** | `mark_in_progress()` | Mark email as started (crash guard) |
-| **db.py** | `mark_retry()` | Increment retry count and re-queue for next cycle |
-| **db.py** | `save_processed()` | Mark email as fully done |
-| **db.py** | `mark_failed()` | Mark email as permanently failed |
-| **db.py** | `reset_failed_emails()` | Reset failed/retry entries for reprocessing |
-| **email_reader.py** | `connect_mail()` | Connect to IMAP; raises `CredentialError` or `QuotaError` |
-| **attachment_handler.py** | `process_email()` | Orchestrate full attachment pipeline |
-| **attachment_handler.py** | `sanitize_filename()` | Sanitize filename (path traversal, dot-file safe) |
-| **attachment_handler.py** | `get_unique_filepath()` | Atomic unique filename (TOCTOU-safe) |
-
----
-
-## Troubleshooting
-
-### Pre-launch check
-Run `python audit.py` once before going to production — it validates all config attributes, module imports, and security settings, and exits 0 (READY) or 1 (NOT READY) with a full report.
-
-### "Email credentials missing in .env"
-Copy `.env.example` to `.env` and set `EMAIL_USER` and `EMAIL_PASS`.
-
-### "Max retries reached"
-Check your internet connection and that Gmail IMAP is enabled (Gmail Settings > Forwarding and POP/IMAP).
-
-### Emails not downloading
-1. Confirm the email has attachments and is under the `MAX_EMAIL_SIZE_MB` limit
-2. Review `app.log` for detailed errors
-3. Verify IMAP is enabled in Gmail settings
-
-### App is stuck / not processing
-Run `health_check.bat` — it will show the heartbeat age and warn if the app is stale.
-
-### Permission denied saving files
-Check write permissions on the `attachments/` folder.
-
-### Want to retry previously failed emails
 ```bash
-python main.py --retry-failed
-```
-Resets all `failed` and `retry` entries to `retry` status — history (retry counts, last error) is preserved in the DB.
-Or manually delete `processed_emails.db` to reset everything (will re-download all emails).
-
-### Another instance is already running
-The app writes a PID lockfile (`app.lock`) on startup. If the previous process exited uncleanly, delete `app.lock` manually and restart.
-
-### Task Scheduler not starting the app
-Run `setup_autostart.bat` as Administrator. Check status with:
-```bat
-schtasks /query /tn "EmailAssetcues"
+python audit.py
 ```
 
----
+The audit checks configuration attributes, module imports, and security settings before deployment.
 
-## Security Notes
+Possible results:
 
-- **Never hardcode credentials** in source code
-- **Never commit `.env`** — it is listed in `.gitignore`
-- Use Gmail **App Passwords**, not your actual Google account password
-- `ALERT_EMAIL` uses SMTP over SSL (port 465) — no plain-text transmission
-
----
-
-## Performance
-
-- **Memory:** ~50MB baseline
-- **CPU:** Minimal — mostly idle, wakes every 30 seconds
-- **Network:** ~1KB per email check + attachment size
-- **Storage:** Depends on attachments downloaded; app warns if disk space falls below `MIN_FREE_DISK_MB`
-
----
-
-## Logs Example
-
-```
-2026-04-03T09:12:01.001 - INFO     - main.py:197   - [-] - Database initialized at processed_emails.db
-2026-04-03T09:12:01.452 - INFO     - email_reader.py:76 - [-] - Connected to imap.gmail.com:993
-2026-04-03T09:12:02.103 - INFO     - main.py:405   - [-] - Found 2 unseen emails
-2026-04-03T09:12:03.210 - INFO     - main.py:408   - [email-42] - Processing Email ID: 42
-2026-04-03T09:12:04.887 - INFO     - attachment_handler.py:271 - [email-42] - Downloaded: attachments/Invoice_April.pdf
-2026-04-03T09:12:05.001 - INFO     - attachment_handler.py:303 - [email-42] - Email marked Seen and Gmail label applied
-2026-04-03T09:12:05.120 - INFO     - main.py:520   - [-] - Waiting 30 seconds before next check
+```text
+READY
+   or
+NOT READY
 ```
 
 ---
 
-## Limitations
+# 📜 Example Logs
 
-- IMAP protocol only (works with Gmail, Outlook, and other IMAP providers)
-- SQLite database — not designed for millions of emails
-- Single-threaded processing
-- Windows Task Scheduler auto-start only (no native Linux systemd service included)
+```text
+2026-04-03T09:12:01.001 - INFO - Database initialized
+2026-04-03T09:12:01.452 - INFO - Connected to imap.gmail.com:993
+2026-04-03T09:12:02.103 - INFO - Found 2 unseen emails
+2026-04-03T09:12:03.210 - INFO - Processing Email ID: 42
+2026-04-03T09:12:04.887 - INFO - Downloaded: Invoice_April.pdf
+2026-04-03T09:12:05.001 - INFO - Email marked Seen
+2026-04-03T09:12:05.120 - INFO - Waiting 30 seconds
+```
 
----
-
-## Future Improvements
-
-- [ ] Multi-threaded attachment processing
-- [ ] PostgreSQL support for scalability
-- [ ] REST API for status/health checks
-- [ ] Email filtering by sender/subject/date
-- [ ] Automatic attachment organization by date/type/sender
-- [ ] Docker containerization
-- [ ] Linux systemd service unit
-- [ ] CI/CD pipeline
+The project includes structured application and watchdog logging for operational visibility.
 
 ---
 
-## Support
+# 🧠 Engineering Concepts Demonstrated
 
-For issues, check in this order:
-1. Run `health_check.bat` for a quick system overview
-2. Check `app.log` for detailed error messages
-3. Check `worker.log` for watchdog restart history
-4. Verify Gmail IMAP is enabled (Settings > Forwarding and POP/IMAP)
-5. Confirm `.env` has correct credentials
+This project demonstrates practical backend and automation engineering concepts:
+
+### 🔄 Automation
+
+Continuous background processing without manual intervention.
+
+### 🗄️ State Management
+
+Persistent email processing states using SQLite.
+
+### 🔐 Security
+
+File validation, sender authentication, credential protection, and malware-oriented checks.
+
+### 🛡️ Fault Tolerance
+
+Retries, backoff, crash recovery, and watchdog restart.
+
+### 💓 Health Monitoring
+
+Heartbeat-based worker health detection.
+
+### 🔒 Concurrency Protection
+
+Single-instance lockfile prevents competing workers.
+
+### 📋 Observability
+
+Rotating logs and health diagnostics.
+
+### ⚙️ Production Operations
+
+Windows Task Scheduler + watchdog architecture.
 
 ---
 
-## License
+# 💼 Interview Explanation
 
-This project is provided as-is for personal use.
+### "Explain your Email Attachment Processor project."
+
+> **I developed an automated email attachment processing system in Python that continuously monitors Gmail through IMAP and downloads attachments from unseen emails. The main challenge was making the system reliable enough to run continuously without manual supervision. I implemented SQLite-based state tracking with statuses such as `in_progress`, `done`, `retry`, and `failed` to prevent duplicate processing and recover from crashes. I also added retry logic with exponential backoff, heartbeat monitoring, rotating logs, a single-instance lockfile, and a Windows watchdog that automatically restarts the application if it crashes. From a security perspective, the system validates file extensions, MIME types, and magic-byte signatures, supports sender authentication through DKIM/SPF/DMARC, and protects credentials through environment variables.**
 
 ---
 
-**Last Updated:** April 6, 2026
-**Version:** 1.3.0-production
+# 🔥 Strong Interview Points
+
+If an interviewer asks **"What makes this more than a simple automation script?"**, highlight:
+
+```text
+Simple Script
+     ❌
+     │
+     ▼
+Downloads Attachments
+
+Production Worker
+     ✅
+     │
+     ├── State Management
+     ├── Retry Logic
+     ├── Crash Recovery
+     ├── Security Validation
+     ├── Logging
+     ├── Health Monitoring
+     ├── Alerting
+     ├── Lockfile Protection
+     ├── Watchdog
+     └── Windows Auto-Start
+```
+
+That distinction makes the project much stronger as a **backend / Python / automation / DevOps-oriented portfolio project**.
+
+---
+
+# ⚠️ Limitations
+
+Current limitations include:
+
+* IMAP-based processing
+* SQLite is not intended for millions of emails
+* Single-threaded processing
+* Windows Task Scheduler is currently used for native auto-start
+
+These limitations are documented in the project specification.
+
+---
+
+# 🚀 Future Improvements
+
+Planned improvements include:
+
+* [ ] Multi-threaded attachment processing
+* [ ] PostgreSQL support
+* [ ] REST API for health/status monitoring
+* [ ] Advanced email filtering
+* [ ] Automatic organization by sender
+* [ ] Automatic organization by date
+* [ ] Automatic organization by file type
+* [ ] Docker support
+* [ ] Linux systemd service
+* [ ] CI/CD pipeline
+* [ ] Centralized monitoring dashboard
+
+---
+
+# 🏆 Project Highlights
+
+<div align="center">
+
+| Feature                  | Implementation                        |
+| ------------------------ | ------------------------------------- |
+| 📧 Email Monitoring      | Gmail / IMAP                          |
+| 📎 Attachment Processing | Python                                |
+| 🗄️ State Management     | SQLite                                |
+| 🔁 Retry System          | Exponential Backoff                   |
+| 🛡️ File Security        | Magic Bytes + MIME + Extension Checks |
+| 🔐 Sender Verification   | DKIM / SPF / DMARC                    |
+| 💓 Health Monitoring     | Heartbeat                             |
+| 📊 Logging               | Rotating Logs                         |
+| 🚨 Alerting              | SMTP                                  |
+| 🔒 Process Protection    | Lockfile                              |
+| 🔄 Crash Recovery        | Watchdog                              |
+| 🪟 Auto Start            | Windows Task Scheduler                |
+
+</div>
+
+---
+
+# 🌟 Why This Project Matters
+
+This project is more than an email downloader.
+
+It demonstrates how to turn a simple automation requirement into a **reliable, secure, continuously running production-style worker**.
+
+The architecture focuses on:
+
+```text
+              RELIABILITY
+                   ▲
+                   │
+        ┌──────────┼──────────┐
+        │          │          │
+     SECURITY   MONITORING   RECOVERY
+        │          │          │
+        └──────────┼──────────┘
+                   │
+                   ▼
+          PRODUCTION WORKER
+```
+
+---
+
+# 📌 Quick Reference
+
+```text
+Project       : Email Attachment Processor
+Language      : Python
+Email         : Gmail / IMAP
+Database      : SQLite
+Platform      : Windows
+Execution     : Background Worker
+Monitoring    : Heartbeat + Logs
+Recovery      : Retry + Watchdog
+Security      : Multi-Layer Validation
+Startup       : Windows Task Scheduler
+```
+
+---
+
+# ⭐ Support
+
+If you find this project useful or interesting, consider giving the repository a ⭐ **Star**.
+
+Feedback, suggestions, and contributions are welcome.
+
+---
+
+<div align="center">
+
+# 📧 Automate Emails. Secure Attachments. Never Miss a File.
+
+### Built with ❤️ using Python
+
+**© 2026 Mayur Pote**
+
+</div>
